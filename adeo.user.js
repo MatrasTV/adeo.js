@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADEO — инструменты работы с прайсами
 // @namespace    admin.adeo.pro
-// @version      3.1.1
+// @version      3.1.2
 // @description  Анализ продаваемости, пересечения, сроки, копирование и оформление статусов импорта
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
@@ -13,7 +13,7 @@
 // @match        https://admin.adeo.pro/admin/admin_pricerelevance/list*
 // @match        https://admin.adeo.pro/admin/supplier/price/compare/*
 // @match        https://admin.adeo.pro/admin/supplier/price/comparemode/*
-// @run-at       document-end
+// @run-at       document-start
 // @grant        none
 // ==/UserScript==
 
@@ -61,9 +61,17 @@
     }
 
     // Переключаем флажок только при несовпадении состояния, учитывая оформление iCheck.
-    function setCheckboxOnce(input, checked) {
+    function setCheckboxOnce(input, checked, silent = false) {
         if (!input || initializedFields.has(input)) return;
         initializedFields.add(input);
+        if (silent) {
+            // Начальное состояние не должно запускать пересоздание таблицы через change/iCheck.
+            input.checked = checked;
+            const wrapper = input.closest('.icheckbox_minimal');
+            wrapper?.classList.toggle('checked', checked);
+            wrapper?.setAttribute('aria-checked', String(checked));
+            return;
+        }
         if (input.checked === checked) return;
         const wrapper = input.closest('.icheckbox_minimal');
         const helper = input.parentElement?.querySelector('.iCheck-helper');
@@ -379,8 +387,49 @@
 
     function activateCheckboxWithText(text) {
         document.querySelectorAll('.checkbox label').forEach(label => {
-            if (label.textContent.trim() === text) setCheckboxOnce(label.querySelector('input[type="checkbox"]'), true);
+            if (label.textContent.trim() === text) setCheckboxOnce(label.querySelector('input[type="checkbox"]'), true, true);
         });
+    }
+
+    function prepareInitialCompareRequest() {
+        if (!/^\/admin\/supplier\/price\/compare\/[^/]+\/[^/]+\/?$/.test(window.location.pathname) ||
+            document.readyState !== 'loading' || typeof XMLHttpRequest === 'undefined') return;
+        const prototype = XMLHttpRequest.prototype;
+        const originalOpen = prototype.open;
+        const originalSend = prototype.send;
+        const requests = new WeakMap();
+        let pending = true;
+
+        function openInitialRequest(method, url, ...args) {
+            requests.delete(this);
+            const result = originalOpen.call(this, method, url, ...args);
+            const address = new URL(url, window.location.href);
+            requests.set(this, { method: String(method).toUpperCase(), address });
+            return result;
+        }
+
+        function sendInitialRequest(body) {
+            const request = requests.get(this);
+            if (pending && request?.method === 'POST' &&
+                request.address.origin === window.location.origin &&
+                request.address.pathname === window.location.pathname &&
+                (body == null || typeof body === 'string' || body instanceof URLSearchParams)) {
+                // Меняем только первый запрос основной таблицы, до его отправки на сервер.
+                const params = new URLSearchParams(body ?? '');
+                const input = document.querySelector('input[name="remains"]');
+                params.set('settings[remains]', input?.value || 'on');
+                body = params.toString();
+                activateCheckboxWithText('Остаток');
+                pending = false;
+                // Последующие запросы полностью управляются действиями пользователя и самой панелью.
+                if (prototype.open === openInitialRequest) prototype.open = originalOpen;
+                if (prototype.send === sendInitialRequest) prototype.send = originalSend;
+            }
+            return originalSend.call(this, body);
+        }
+
+        prototype.open = openInitialRequest;
+        prototype.send = sendInitialRequest;
     }
 
     function updateDropdownValues(dropdown) {
@@ -551,5 +600,9 @@
         else if (path.startsWith('/admin/supplier/price/comparemode/')) initCompareMode();
     }
 
-    init();
+    prepareInitialCompareRequest();
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
+    else {
+        init();
+    }
 })();
