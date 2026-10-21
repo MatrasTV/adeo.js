@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADEO — инструменты работы с прайсами
 // @namespace    admin.adeo.pro
-// @version      3.0.0
+// @version      3.0.3
 // @description  Анализ продаваемости, пересечения, сроки, копирование и оформление статусов импорта
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
@@ -23,6 +23,8 @@
     const SROKI_URL = 'https://192.168.3.19:6001/sroki';
     const PAGE_SIZES = [10, 50, 100, 500, 1000, 3000, 5000, 10000, 100000];
     const initializedFields = new WeakSet();
+    const filteredRowDisplays = new WeakMap();
+    const supplierRowHeights = new WeakMap();
 
     // Следим за появлением элементов и обновлением текста без постоянного опроса.
     function observePage(update) {
@@ -279,8 +281,49 @@
                 copyText(`${getSupplierKey(row)} (${getCellText(row, 'supplier_price_unique_cnt')}) ${getCellText(row, 'supplier_price_unique_prc_dup')}%`);
             }, 'adeo-copy-button');
             Object.assign(button.style, { marginLeft: '10px', float: 'right' });
+            // В jqGrid действует white-space: pre: перенос в названии иначе опускает кнопку ниже.
+            Object.assign(fullname.style, { display: 'flex', justifyContent: 'space-between', alignItems: 'center' });
             fullname.appendChild(button);
         });
+    }
+
+    function filterSupplierRows() {
+        getSupplierRows().forEach(row => {
+            const hidden = getCellText(row, 'supplier_price_unique_supplier_cella').includes('Reg');
+            const targets = [row];
+            // Развёрнутая детализация jqGrid находится в отдельной строке сразу после поставщика.
+            if (row.nextElementSibling?.classList.contains('ui-subgrid')) targets.push(row.nextElementSibling);
+            targets.forEach(target => {
+                if (hidden) {
+                    if (!filteredRowDisplays.has(target)) filteredRowDisplays.set(target, target.style.display);
+                    target.style.display = 'none';
+                } else if (filteredRowDisplays.has(target)) {
+                    target.style.display = filteredRowDisplays.get(target);
+                    filteredRowDisplays.delete(target);
+                }
+            });
+        });
+    }
+
+    function syncSupplierScrollHeight() {
+        const table = document.querySelector('#supplier_price_unique');
+        const wrapper = table?.parentElement;
+        if (!wrapper?.parentElement?.classList.contains('ui-jqgrid-bdiv')) return;
+        const rows = getSupplierRows();
+        const records = Number(table.p?.records);
+        if (!table.p || (Number.isFinite(records) && rows.length >= records)) {
+            // При полной загрузке резерв виртуальной прокрутки больше не нужен.
+            wrapper.style.height = 'auto';
+            return;
+        }
+        if (!Number.isFinite(records) || records <= 0) return;
+        // До завершения загрузки сохраняем резерв для записей, которых ещё нет в DOM.
+        const rowHeight = table.grid?.prevRowHeight || rows.find(row => row.offsetHeight > 0)?.offsetHeight ||
+            supplierRowHeights.get(table) || parseFloat(wrapper.style.height) / records;
+        if (!Number.isFinite(rowHeight) || rowHeight <= 0) return;
+        supplierRowHeights.set(table, rowHeight);
+        const hiddenCount = rows.filter(row => filteredRowDisplays.has(row)).length;
+        wrapper.style.height = `${Math.max(0, records - hiddenCount) * rowHeight}px`;
     }
 
     function copyIntersections(header) {
@@ -318,6 +361,8 @@
             activateCheckboxWithText('Остаток');
             document.querySelectorAll('select.ui-pg-selbox').forEach(updateDropdownValues);
             addCopyButtons();
+            filterSupplierRows();
+            syncSupplierScrollHeight();
             addCopyHeaderButtons();
             increaseWorkAreaHeight();
         });
