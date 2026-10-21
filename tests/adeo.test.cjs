@@ -16,7 +16,7 @@ function setup(pathname = '/неизвестная-страница') {
     const copied = [];
     const alerts = [];
     const context = vm.createContext({
-        document: { querySelectorAll: () => [], querySelector: () => null },
+        document: { querySelectorAll: () => [], querySelector: () => null, addEventListener() {} },
         window: { location: { pathname, href: '' } },
         navigator: { clipboard: { writeText: async text => copied.push(text) } },
         Event: class { constructor(type) { this.type = type; } },
