@@ -3,6 +3,13 @@
 // @namespace    admin.adeo.pro
 // @version      3.0.0
 // @description  Анализ продаваемости, пересечения, сроки, копирование и оформление статусов импорта
+// @author       MatrasTV
+// @icon         https://github.com/MatrasTV.png?size=128
+// @homepageURL  https://github.com/MatrasTV/adeo.js
+// @source       https://github.com/MatrasTV/adeo.js.git
+// @supportURL   https://github.com/MatrasTV/adeo.js/issues
+// @downloadURL  https://github.com/MatrasTV/adeo.js/releases/latest/download/adeo.user.js
+// @updateURL    https://github.com/MatrasTV/adeo.js/releases/latest/download/adeo.user.js
 // @match        https://admin.adeo.pro/admin/admin_pricerelevance/list*
 // @match        https://admin.adeo.pro/admin/supplier/price/compare/*
 // @match        https://admin.adeo.pro/admin/supplier/price/comparemode/*
