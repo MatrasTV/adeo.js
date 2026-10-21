@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADEO — инструменты работы с прайсами
 // @namespace    admin.adeo.pro
-// @version      3.1.2
+// @version      3.2.0
 // @description  Анализ продаваемости, пересечения, сроки, копирование и оформление статусов импорта
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
@@ -27,11 +27,19 @@
     const supplierRowHeights = new WeakMap();
     const copyFeedback = new WeakMap();
     const priceDifferenceValues = new WeakMap();
+    const loadingRequests = new Map();
     let hideReg = true;
 
     // Следим за появлением элементов и обновлением текста без постоянного опроса.
     function observePage(update) {
-        const observer = new MutationObserver(update);
+        const observer = new MutationObserver(mutations => {
+            // Тики таймера загрузки не должны повторно обходить всю таблицу.
+            if (mutations.every(mutation => {
+                const element = mutation.target.nodeType === 3 ? mutation.target.parentElement : mutation.target;
+                return element?.closest?.('.adeo-loading');
+            })) return;
+            update();
+        });
         const config = { childList: true, subtree: true, characterData: true };
         observer.observe(document.body, config);
         update();
@@ -432,6 +440,173 @@
         prototype.send = sendInitialRequest;
     }
 
+    function installLoadingStyles() {
+        if (document.querySelector('#adeo-loading-styles')) return;
+        const style = document.createElement('style');
+        style.id = 'adeo-loading-styles';
+        style.textContent = `
+            .ui-jqgrid .loading.adeo-loading { left: 50%; top: 45%; transform: translateX(-50%); width: max-content; max-width: calc(100% - 24px); box-sizing: border-box; padding: 12px 16px; border: 1px solid #c7d5e4; border-radius: 6px; background: #fff; color: #294760; box-shadow: 0 3px 14px #18334d20; font: 14px/1.5 Arial, sans-serif; white-space: normal; text-align: center; z-index: 1001; }
+            .adeo-loading::before { content: ''; display: inline-block; width: 14px; height: 14px; margin-right: 9px; vertical-align: -2px; border: 2px solid #d5e3ef; border-top-color: #3274b5; border-radius: 50%; animation: adeo-loading-spin .8s linear infinite; }
+            .adeo-loading.adeo-loading-error { color: #963c36; border-color: #e3bdb9; }
+            .adeo-loading.adeo-loading-error::before { display: none; }
+            .adeo-loading-timer { margin-left: 7px; font-variant-numeric: tabular-nums; color: #63788a; }
+            @keyframes adeo-loading-spin { to { transform: rotate(360deg); } }
+            @media (prefers-reduced-motion: reduce) { .adeo-loading::before { animation: none; } }
+        `;
+        (document.head ?? document.documentElement).appendChild(style);
+    }
+
+    function findLoadingGrid(address, body) {
+        if (address.origin !== window.location.origin) return null;
+        const path = window.location.pathname.replace(/\/$/, '');
+        if (address.pathname.replace(/\/$/, '') === path) return 'supplier_price_unique';
+        const detailsPath = path.replace('/price/compare/', '/price/compare/list/');
+        if (address.pathname.replace(/\/$/, '') !== detailsPath) return null;
+        const params = typeof body === 'string' || body instanceof URLSearchParams ? new URLSearchParams(body) : null;
+        const candidates = Array.from(document.querySelectorAll('.subgrid-data table.ui-jqgrid-btable'));
+        const matching = candidates.filter(table => {
+            const row = table.p?.postData?.row_id;
+            if (!row || !params) return false;
+            const keys = ['storage_id', 'cella_id', 'n_file', 'supplier_cella'].filter(key => row[key] != null && params.has(`row_id[${key}]`));
+            return keys.length > 0 && keys.every(key => params.get(`row_id[${key}]`) === String(row[key]));
+        });
+        // Без однозначного соответствия не показываем запрос в чужой детализации.
+        return matching.length === 1 ? matching[0].id :
+            candidates.length === 1 && !candidates[0].p?.postData?.row_id ? candidates[0].id : null;
+    }
+
+    function renderLoadingState(state) {
+        if (loadingRequests.get(state.gridId) !== state) return;
+        const loader = document.getElementById(`load_${state.gridId}`);
+        if (!loader) return;
+        installLoadingStyles();
+        loader.classList.add('adeo-loading');
+        loader.classList.toggle('adeo-loading-error', state.stage === 'error' || state.stage === 'cancelled');
+        loader.dataset.adeoStage = state.stage;
+        loader.setAttribute('role', 'status');
+        loader.setAttribute('aria-live', 'polite');
+        let message = loader.querySelector('.adeo-loading-message');
+        let timer = loader.querySelector('.adeo-loading-timer');
+        if (!message || !timer) {
+            message = document.createElement('span');
+            message.className = 'adeo-loading-message';
+            timer = document.createElement('span');
+            timer.className = 'adeo-loading-timer';
+            timer.setAttribute('aria-hidden', 'true');
+            loader.replaceChildren(message, timer);
+        }
+        if (message.textContent !== state.message) message.textContent = state.message;
+        const elapsed = ((state.finishedAt ?? performance.now()) - state.startedAt) / 1000;
+        const time = `${elapsed.toFixed(1).replace('.', ',')} с`;
+        if (timer.textContent !== time) timer.textContent = time;
+        loader.style.display = 'block';
+    }
+
+    function trackLoadingRequest(xhr, gridId) {
+        const previous = loadingRequests.get(gridId);
+        if (previous) {
+            clearInterval(previous.timer);
+            if (previous.frame) cancelAnimationFrame(previous.frame);
+        }
+        const state = { gridId, startedAt: performance.now(), stage: 'waiting', message: 'Ожидание ответа сервера…' };
+        loadingRequests.set(gridId, state);
+        state.timer = setInterval(() => renderLoadingState(state), 100);
+        renderLoadingState(state);
+
+        function setLoadingStage(stage, message) {
+            state.stage = stage;
+            state.message = message;
+            renderLoadingState(state);
+        }
+
+        function finishLoading(stage, message) {
+            if (loadingRequests.get(gridId) !== state) return;
+            clearInterval(state.timer);
+            state.finishedAt = performance.now();
+            setLoadingStage(stage, message);
+            if (stage !== 'rendering') return;
+            // Даём обработчику jqGrid заполнить таблицу и браузеру отрисовать результат.
+            state.frame = requestAnimationFrame(() => {
+                state.frame = requestAnimationFrame(() => {
+                    if (loadingRequests.get(gridId) !== state) return;
+                    const loader = document.getElementById(`load_${gridId}`);
+                    if (loader) loader.style.display = 'none';
+                    loadingRequests.delete(gridId);
+                });
+            });
+        }
+
+        xhr.addEventListener('readystatechange', () => {
+            if (xhr.readyState === 2 || xhr.readyState === 3) setLoadingStage('receiving', 'Получение данных…');
+            if (xhr.readyState === 4 && ((xhr.status >= 200 && xhr.status < 300) || xhr.status === 304)) {
+                setLoadingStage('rendering', 'Формирование таблицы…');
+            }
+        }, { capture: true });
+        xhr.addEventListener('progress', event => {
+            if (state.finishedAt != null || state.stage === 'rendering') return;
+            const percent = event.lengthComputable && event.total > 0
+                ? ` ${Math.min(100, Math.round(event.loaded / event.total * 100))}%` : '';
+            setLoadingStage('receiving', `Получение данных…${percent}`);
+        });
+        xhr.addEventListener('load', () => {
+            if ((xhr.status >= 200 && xhr.status < 300) || xhr.status === 304) {
+                finishLoading('rendering', 'Формирование таблицы…');
+            } else {
+                finishLoading('error', `Не удалось загрузить данные (HTTP ${xhr.status})`);
+            }
+        });
+        xhr.addEventListener('error', () => finishLoading('error', 'Не удалось загрузить данные. Ошибка сети.'));
+        xhr.addEventListener('timeout', () => finishLoading('error', 'Не удалось загрузить данные. Время ожидания истекло.'));
+        xhr.addEventListener('abort', () => finishLoading('cancelled', 'Загрузка отменена.'));
+        return state;
+    }
+
+    function installLoadingProgress() {
+        if (!/^\/admin\/supplier\/price\/compare\/[^/]+\/[^/]+\/?$/.test(window.location.pathname) ||
+            typeof XMLHttpRequest === 'undefined') return;
+        const prototype = XMLHttpRequest.prototype;
+        const originalOpen = prototype.open;
+        const originalSend = prototype.send;
+        const requests = new WeakMap();
+
+        function openTrackedRequest(method, url, ...args) {
+            requests.delete(this);
+            const result = originalOpen.call(this, method, url, ...args);
+            requests.set(this, { method: String(method).toUpperCase(), address: new URL(url, window.location.href) });
+            return result;
+        }
+
+        function sendTrackedRequest(body) {
+            const request = requests.get(this);
+            const gridId = request?.method === 'POST' ? findLoadingGrid(request.address, body) : null;
+            const state = gridId ? trackLoadingRequest(this, gridId) : null;
+            try {
+                return originalSend.call(this, body);
+            } catch (error) {
+                if (state) {
+                    clearInterval(state.timer);
+                    state.finishedAt = performance.now();
+                    state.stage = 'error';
+                    state.message = 'Не удалось отправить запрос.';
+                    renderLoadingState(state);
+                }
+                throw error;
+            }
+        }
+
+        prototype.open = openTrackedRequest;
+        prototype.send = sendTrackedRequest;
+        window.addEventListener('pagehide', () => {
+            loadingRequests.forEach(state => {
+                clearInterval(state.timer);
+                if (state.frame) cancelAnimationFrame(state.frame);
+                const loader = document.getElementById(`load_${state.gridId}`);
+                if (loader) loader.style.display = 'none';
+            });
+            loadingRequests.clear();
+        });
+    }
+
     function updateDropdownValues(dropdown) {
         if (dropdown.dataset.adeoUpdated) return;
         const selectedValue = dropdown.value;
@@ -600,6 +775,7 @@
         else if (path.startsWith('/admin/supplier/price/comparemode/')) initCompareMode();
     }
 
+    installLoadingProgress();
     prepareInitialCompareRequest();
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
     else {

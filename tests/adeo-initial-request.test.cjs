@@ -51,7 +51,12 @@ test('Первичная загрузка отправляет один запр
                 await route.fulfill({ contentType: 'application/json', body: '{"page":1,"records":0,"total":0,"rows":[]}' });
             }
         });
-        const source = readFileSync(resolve(__dirname, '../adeo.user.js'), 'utf8');
+        const source = readFileSync(resolve(__dirname, '../adeo.user.js'), 'utf8').replace(
+            '    installLoadingProgress();',
+            `    installLoadingProgress();
+                window.monitoredOpen = XMLHttpRequest.prototype.open;
+                window.monitoredSend = XMLHttpRequest.prototype.send;`
+        );
         await page.addInitScript({ content: `window.originalOpen = XMLHttpRequest.prototype.open;
             window.originalSend = XMLHttpRequest.prototype.send;\n${source}` });
         await page.goto(endpoint);
@@ -65,8 +70,8 @@ test('Первичная загрузка отправляет один запр
         assert.equal(await page.locator('input[name="remains"]').isChecked(), true);
         assert.equal(await page.locator('.icheckbox_minimal').getAttribute('aria-checked'), 'true');
         assert.equal(await page.evaluate(() => window.changes), 0);
-        assert.equal(await page.evaluate(() => XMLHttpRequest.prototype.open === window.originalOpen &&
-            XMLHttpRequest.prototype.send === window.originalSend), true, 'Исходные методы запросов должны восстановиться');
+        assert.equal(await page.evaluate(() => XMLHttpRequest.prototype.open === window.monitoredOpen &&
+            XMLHttpRequest.prototype.send === window.monitoredSend), true, 'Одноразовая правка запроса должна отключиться, сохранив наблюдение за загрузкой');
         assert.ok(requests.filter(request => request.url !== endpoint).every(request => request.body === 'probe=1'));
 
         await page.locator('.adeo-settings-toggle').click();
