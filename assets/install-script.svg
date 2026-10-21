@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="420" height="80" viewBox="0 0 420 80" role="img" aria-labelledby="title">
+  <title id="title">Установить скрипт</title>
+  <rect x="1" y="1" width="418" height="78" rx="12" fill="#238636" stroke="#1b6b2b" stroke-width="2"/>
+  <g fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M46 22v25m-9-9 9 9 9-9"/>
+    <path d="M31 48v10h30V48"/>
+  </g>
+  <text x="240" y="42" fill="#ffffff" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="700" text-anchor="middle" dominant-baseline="middle">Установить скрипт</text>
+</svg>

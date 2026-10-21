@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADEO — инструменты работы с прайсами
 // @namespace    admin.adeo.pro
-// @version      3.1.0
+// @version      3.1.1
 // @description  Анализ продаваемости, пересечения, сроки, копирование и оформление статусов импорта
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
@@ -308,6 +308,7 @@
         }, 'adeo-settings-toggle');
         settingsButton.disabled = !settings;
         if (settings) {
+            settings.hidden = true;
             settings.classList.add('adeo-settings-body');
             if (!settings.id) settings.id = 'adeo-compare-settings';
             settingsButton.setAttribute('aria-controls', settings.id);

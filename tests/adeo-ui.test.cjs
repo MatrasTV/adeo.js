@@ -68,6 +68,8 @@ test('Панель, переключатель Reg, оформление цен,
         });
         await page.addScriptTag({ content: readFileSync(resolve(__dirname, '../adeo.user.js'), 'utf8') });
         await page.waitForFunction(() => document.querySelector('.adeo-row-count')?.textContent === 'Показано: 2 · Скрыто Reg: 1');
+        assert.equal(await page.locator('fieldset').isVisible(), false);
+        assert.equal(await page.locator('.adeo-settings-toggle').getAttribute('aria-expanded'), 'false');
         const heights = await page.locator('.adeo-toolbar > button').evaluateAll(buttons => buttons.map(button => button.getBoundingClientRect().height));
         assert.deepEqual([...new Set(heights)], [36]);
         assert.equal(await page.locator('#cella').evaluate(row => row.classList.contains('adeo-expanded')), true);
@@ -86,9 +88,10 @@ test('Панель, переключатель Reg, оформление цен,
         assert.equal(await page.evaluate(() => window.formChanges), changesBefore);
         await page.locator('.adeo-hide-reg').click();
         await page.locator('.adeo-settings-toggle').click();
-        assert.equal(await page.locator('fieldset').isVisible(), false);
-        await page.locator('.adeo-settings-toggle').click();
         assert.equal(await page.locator('fieldset').isVisible(), true);
+        assert.equal(await page.locator('.adeo-settings-toggle').getAttribute('aria-expanded'), 'true');
+        await page.locator('.adeo-settings-toggle').click();
+        assert.equal(await page.locator('fieldset').isVisible(), false);
 
         await page.locator('#cella .adeo-copy-button').click();
         await page.waitForFunction(() => document.querySelector('#cella .adeo-copy-button').textContent === 'Скопировано ✓');
