@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADEO — прайсы и расписание поставщиков
 // @namespace    admin.adeo.pro
-// @version      3.3.0
+// @version      3.3.1
 // @description  Работа с прайсами и мастер еженедельного расписания поставщиков CRM
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
@@ -835,6 +835,17 @@
         return value === null || value === undefined || value === '' ? '' : String(value);
     }
 
+    function scheduleScopesOverlap(left, right) {
+        const a = scheduleNfile(left), b = scheduleNfile(right);
+        return a === '' || b === '' || a === b;
+    }
+
+    function scheduleReplacesGeneralRule(conflict) {
+        return !conflict.group.nfiles.some(value => scheduleNfile(value) === '') &&
+            (conflict.weekly.some(series => series.instances.some(event => scheduleNfile(event.nfile) === '')) ||
+                conflict.once.some(event => scheduleNfile(event.nfile) === ''));
+    }
+
     function isWeeklySchedule(event) {
         return Boolean(event.weeklyScheduleId) && String(event.weeklyScheduleId) !== '0';
     }
@@ -937,11 +948,10 @@
 
     function findScheduleConflicts(events, groups) {
         return groups.filter(group => group.enabled).map(group => {
-            const scopes = new Set(group.nfiles.map(scheduleNfile));
             const series = new Map();
             const once = [];
             for (const event of events) {
-                if (!scopes.has(scheduleNfile(event.nfile))) continue;
+                if (!group.nfiles.some(value => scheduleScopesOverlap(value, event.nfile))) continue;
                 const day = scheduleDay(event.ordersAcceptedAt);
                 if (isWeeklySchedule(event) && scheduleWeekday(day) === scheduleWeekday(group.date)) {
                     const key = String(event.weeklyScheduleId);
@@ -968,14 +978,18 @@
             const decision = count ? decisions[group.date] : 'add';
             if (decision === 'skip') continue;
             if (decision !== 'add' && decision !== 'replace') throw new Error('Выберите действие для каждого заполненного дня.');
-            const slots = new Set();
+            if (decision === 'replace' && scheduleReplacesGeneralRule(conflict)) {
+                throw new Error(`${group.date}: найдено общее правило для всех складов. Его нельзя удалить при замене только выбранного склада: это изменит расписание остальных. Выберите «Все склады» для общей замены либо измените общее правило штатной формой CRM.`);
+            }
+            const slots = [];
             for (const row of group.entries) {
                 if (row.sendDate !== group.date || !group.nfiles.some(value => scheduleNfile(value) === scheduleNfile(row.nfile))) throw new Error('Запись оказалась вне выбранного дня или склада.');
                 const errors = validateScheduleDraft(row, deliveryDays, today);
                 if (errors.length) throw new Error(`${group.date}: ${errors.join(' ')}`);
-                const slot = JSON.stringify([scheduleNfile(row.nfile), row.sendTime]);
-                if (slots.has(slot)) throw new Error(`${group.date}: две отправки одного склада назначены на ${row.sendTime}.`);
-                slots.add(slot);
+                if (slots.some(slot => slot.sendTime === row.sendTime && scheduleScopesOverlap(slot.nfile, row.nfile))) {
+                    throw new Error(`${group.date}: две отправки для пересекающихся складов назначены на ${row.sendTime}.`);
+                }
+                slots.push(row);
             }
             if (decision === 'replace') {
                 for (const series of weekly) {
@@ -995,12 +1009,12 @@
                 const payload = scheduleDraftPayload(draft, supplierId);
                 if (decision === 'add') {
                     const sameWeeklySlot = weekly.filter(series => series.instances.some(event =>
-                        scheduleNfile(event.nfile) === scheduleNfile(draft.nfile) && scheduleTime(event.ordersAcceptedAt) === draft.sendTime));
+                        scheduleScopesOverlap(event.nfile, draft.nfile) && scheduleTime(event.ordersAcceptedAt) === draft.sendTime));
                     const identical = sameWeeklySlot.some(series => series.first && series.instances.some(event =>
                         scheduleDay(event.ordersAcceptedAt) <= group.date && scheduleRepeatSignature(event) === scheduleRepeatSignature(payload)));
                     if (identical) { skipped++; continue; }
-                    if (sameWeeklySlot.length || once.some(event => scheduleNfile(event.nfile) === scheduleNfile(draft.nfile) && scheduleTime(event.ordersAcceptedAt) === draft.sendTime)) {
-                        throw new Error(`${group.date}, ${draft.sendTime}: отправка этого склада уже существует. Выберите «Заменить» или другое время.`);
+                    if (sameWeeklySlot.length || once.some(event => scheduleScopesOverlap(event.nfile, draft.nfile) && scheduleTime(event.ordersAcceptedAt) === draft.sendTime)) {
+                        throw new Error(`${group.date}, ${draft.sendTime}: в пересекающемся расписании уже существует отправка для этих складов. Выберите «Заменить», если замена доступна, или другое время.`);
                     }
                 }
                 operations.push({ type: 'create', payload });
@@ -1029,6 +1043,42 @@
         };
     }
 
+    // Показываем тело ответа сервера, не копируя заголовки авторизации и служебные настройки запроса.
+    function describeScheduleRequestError(error, operation) {
+        const status = Number(error?.response?.status || error?.status) || null;
+        const data = error?.response?.data;
+        let responseText = '';
+        const seen = new Set();
+        function messages(value) {
+            if (value === null || value === undefined) return [];
+            if (typeof value === 'string') {
+                const text = value.trim();
+                if (!text) return [];
+                try { return messages(JSON.parse(text)); } catch { return [text]; }
+            }
+            if (typeof value !== 'object') return [String(value)];
+            if (seen.has(value)) return [];
+            seen.add(value);
+            if (Array.isArray(value)) return value.slice(0, 20).flatMap(messages);
+            const parts = ['message', 'error', 'errors', 'detail', 'details', 'reason', 'description', 'violations', 'fieldErrors', 'defaultMessage']
+                .filter(key => value[key] !== undefined).flatMap(key => messages(value[key]));
+            if (parts.length) return parts;
+            try { return [JSON.stringify(value)]; } catch { return []; }
+        }
+        try { responseText = [...new Set(messages(data))].join('\n').slice(0, 3000); } catch { /* Сохраняем основное сообщение, даже если формат ответа неизвестен. */ }
+        const subject = operation?.type === 'remove' ? 'удалении записи расписания' : 'создании еженедельной записи';
+        const lines = [status ? `CRM вернула HTTP ${status} при ${subject}.` : `Ошибка при ${subject}.`];
+        const entry = operation?.payload || operation?.event;
+        if (entry) {
+            try {
+                lines.push(`Отправка: ${scheduleDay(entry.ordersAcceptedAt)} ${scheduleTime(entry.ordersAcceptedAt)}. Склад: ${scheduleNfile(entry.nfile) || 'все (общая запись)'}.`);
+                if (entry.orderDeliveryIntervalStart && entry.orderDeliveryIntervalEnd) lines.push(`Доставка: ${scheduleDay(entry.orderDeliveryIntervalStart)} ${scheduleTime(entry.orderDeliveryIntervalStart)}–${scheduleTime(entry.orderDeliveryIntervalEnd)}.`);
+            } catch { /* Ошибка формата записи не должна скрывать исходный ответ CRM. */ }
+        }
+        lines.push(responseText ? `Ответ CRM: ${responseText}` : `Причина: ${error?.message || 'Сервер не сообщил подробности.'}`);
+        return lines.join('\n');
+    }
+
     async function runSchedulePlan(job, adapter, checkContext, onProgress = () => {}) {
         if (job.uncertain) throw new Error('Сначала проверьте результат прерванной операции.');
         while (job.index < job.operations.length) {
@@ -1043,9 +1093,9 @@
                 onProgress(job);
             } catch (error) {
                 job.uncertain = true;
-                job.error = error?.message || 'CRM не подтвердила выполнение операции.';
+                job.error = describeScheduleRequestError(error, operation);
                 onProgress(job);
-                throw error;
+                throw new Error(job.error, { cause: error });
             }
         }
         return job;
@@ -1259,12 +1309,11 @@
         function reviewErrors() {
             const errors = [];
             for (const group of state.groups.filter(item => item.enabled)) {
-                const slots = new Set();
+                const slots = [];
                 for (const row of group.entries) {
                     errors.push(...validateScheduleDraft(row, state.deliveryDays).map(text => `${group.date}, ${row.sendTime || 'время не указано'}: ${text}`));
-                    const slot = JSON.stringify([scheduleNfile(row.nfile), row.sendTime]);
-                    if (slots.has(slot)) errors.push(`${group.date}: повторная отправка одного склада в ${row.sendTime}.`);
-                    slots.add(slot);
+                    if (slots.some(slot => slot.sendTime === row.sendTime && scheduleScopesOverlap(slot.nfile, row.nfile))) errors.push(`${group.date}: повторная отправка для пересекающихся складов в ${row.sendTime}.`);
+                    slots.push(row);
                 }
             }
             return errors;
@@ -1324,7 +1373,7 @@
                 select(box, 'Номер склада', scheduleNfile(state.nfile), [{ value: '', label: 'Все склады — общее правило' }, ...state.storages.map(storage => ({
                     value: String(storage.nfile), label: `${storage.nfile}${storage.name ? ` — ${storage.name}` : ''}`
                 }))], value => { state.nfile = value === '' ? null : state.storages.find(storage => String(storage.nfile) === value)?.nfile ?? value; });
-                note(box, 'Общее правило хранится с пустым номером склада. Отдельные правила конкретных складов при его замене сохраняются.');
+                note(box, '«Все склады» пересекается с расписаниями отдельных складов. При замене будут показаны и затронуты правила всех складов выбранного дня недели.');
                 field(box, 'Начать с', 'date', state.startDate, value => { state.startDate = value; }, { min: addScheduleDays(scheduleDay(), 1) }); content.append(box);
                 weekdays(content, '2. Когда отправлять заказы поставщику', 'orderDays');
                 weekdays(content, '3. Когда поставщик может привезти товар', 'deliveryDays', true);
@@ -1449,7 +1498,10 @@
         function renderConfirm() {
             const conflicts = findScheduleConflicts(state.events, state.groups).filter(item => item.count);
             content.append(scheduleElement('h3', 'Проверка перед сохранением'));
-            note(content, 'Новые записи будут повторяться еженедельно. «Заменить» прекращает прежние повторы с указанной будущей даты и удаляет разовые записи этой даты в выбранных складах. Прошедшие даты и другие склады сохраняются.');
+            note(content, 'Новые записи будут повторяться еженедельно. «Заменить» прекращает показанные прежние повторы с указанной будущей даты и удаляет разовые записи этой даты в затронутых складах. Прошедшие даты сохраняются.');
+            if (state.groups.some(group => group.enabled && group.nfiles.some(value => scheduleNfile(value) === ''))) {
+                note(content, 'Выбраны все склады: замена включает правила отдельных складов выбранных дней недели. Проверьте их список перед подтверждением.');
+            }
             if (!conflicts.length) note(content, 'Существующих записей в выбранных днях и складах не найдено. Можно сохранить подготовленное расписание.');
             else {
                 const bulk = scheduleElement('div', null, 'adeo-schedule-flex');
@@ -1464,6 +1516,7 @@
                     note(details, `Существующих правил: ${conflict.count}. Новых записей: ${conflict.group.entries.length}.`);
                     for (const series of conflict.weekly) note(details, `Еженедельно: ${describeEvent(series.first || series.instances[0])}${series.first ? '' : ' — будущий экземпляр пока не загружен, замена недоступна'}`);
                     for (const event of conflict.once) note(details, `Разовая: ${describeEvent(event)}`);
+                    if (scheduleReplacesGeneralRule(conflict)) note(details, 'Общее правило действует на все склады. Его удаление при замене только одного склада заблокировано.');
                     box.append(details);
                     select(box, 'Действие', state.decisions[conflict.group.date] || '', [
                         { value: '', label: 'Выберите действие' }, { value: 'add', label: 'Добавить' }, { value: 'replace', label: 'Заменить' }, { value: 'skip', label: 'Пропустить день' }

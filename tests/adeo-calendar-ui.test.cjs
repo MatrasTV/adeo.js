@@ -114,7 +114,7 @@ async function seedCopy(page, dates) {
     await page.getByRole('button', { name: 'Сохранить всё', exact: true }).waitFor();
 }
 
-test('Копирование берёт только еженедельные записи и заменяет только исходные склады', {
+test('Копирование берёт только еженедельные записи и при общем правиле заменяет пересекающиеся склады', {
     skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 45000
 }, async () => {
     const { browser, page, dates, errors } = await fixture();
@@ -127,12 +127,12 @@ test('Копирование берёт только еженедельные з
         await page.getByRole('button', { name: 'Подтвердить сохранение', exact: true }).click();
         await page.getByRole('heading', { name: 'Расписание сохранено', exact: true }).waitFor();
         const data = await page.evaluate(() => ({ events: window.events, mutations: window.mutations }));
-        assert.deepEqual(data.mutations.filter(item => item.type === 'remove').map(item => [item.id, item.future]), [[4, true], [5, true]]);
+        assert.deepEqual(data.mutations.filter(item => item.type === 'remove').map(item => [item.id, item.future]), [[4, true], [5, true], [6, true]]);
         const created = data.mutations.filter(item => item.type === 'create').map(item => item.payload);
         assert.equal(created.length, 2);
         assert.deepEqual(created.map(item => item.nfile), [7, null]);
         assert.ok(created.every(item => item.ordersAcceptedAt.startsWith(dates.target) && item.repeatWeekly && item.orderDeliveryIntervalStart === null));
-        assert.ok([1, 2, 3, 6].every(id => data.events.some(event => event.id === id)));
+        assert.ok([1, 2, 3].every(id => data.events.some(event => event.id === id)));
         assert.deepEqual(errors, []);
     } finally { await browser.close(); }
 });
@@ -202,6 +202,77 @@ test('Копирование дня в черновике спрашивает �
         await page.getByRole('button', { name: 'Добавить', exact: true }).click();
         assert.equal(await saturday.locator('.adeo-schedule-row').count(), 2);
         assert.equal(await page.evaluate(() => window.mutations.length), 0);
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
+test('HTTP 417 отображает ответ CRM и останавливает очередь без повторной отправки', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 45000
+}, async () => {
+    const { browser, page, dates, errors } = await fixture();
+    try {
+        await seedCopy(page, dates);
+        await page.evaluate(() => {
+            window.rejectedRequests = 0;
+            window.calendarProxy.$API.supplier.schedule.create = async () => {
+                window.rejectedRequests++;
+                const error = new Error('Request failed with status code 417');
+                error.response = { status: 417, data: { message: 'Текст причины от CRM' } };
+                throw error;
+            };
+        });
+        await page.getByRole('button', { name: 'Сохранить всё', exact: true }).click();
+        await page.getByRole('button', { name: 'Везде добавить', exact: true }).click();
+        await page.getByRole('button', { name: 'Подтвердить сохранение', exact: true }).click();
+        await page.getByRole('heading', { name: 'Сохранение остановлено', exact: true }).waitFor();
+        const text = await page.getByRole('alert').textContent();
+        assert.match(text, /HTTP 417/);
+        assert.match(text, /Текст причины от CRM/);
+        assert.match(text, /Отправка:/);
+        assert.equal(await page.evaluate(() => window.rejectedRequests), 1);
+        assert.equal(await page.evaluate(() => window.mutations.length), 0);
+        await page.getByRole('button', { name: 'Проверить результат и продолжить', exact: true }).click();
+        await page.getByRole('alert').filter({ hasText: 'Продолжение заблокировано' }).waitFor();
+        assert.equal(await page.evaluate(() => window.rejectedRequests), 1);
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
+test('Заполнение с нуля для всех складов предлагает выбор при уже существующих отдельных расписаниях', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 45000
+}, async () => {
+    const { browser, page, dates, errors } = await fixture();
+    try {
+        await page.evaluate(date => {
+            window.events = [7, 8].map((nfile, index) => ({ id: index + 1, weeklyScheduleId: index + 100,
+                supplierId: 127, nfile, ordersAcceptedAt: `${date}T09:00:00+03:00`,
+                orderDeliveryIntervalStart: null, orderDeliveryIntervalEnd: null }));
+        }, dates.friday);
+        await page.getByRole('button', { name: 'Мастер расписания', exact: true }).click();
+        await page.getByRole('button', { name: 'Заполнить с нуля' }).click();
+        assert.equal(await page.getByLabel('Номер склада', { exact: true }).inputValue(), '');
+        await page.getByLabel('Начать с', { exact: true }).fill(dates.friday);
+        const orderDays = page.locator('.adeo-schedule-box').filter({ hasText: '2. Когда отправлять' });
+        for (const name of ['Понедельник', 'Вторник', 'Среда', 'Четверг']) await orderDays.getByLabel(name, { exact: true }).uncheck();
+        await page.getByRole('button', { name: 'Далее: заполнить день', exact: true }).click();
+        await page.getByRole('button', { name: 'Заполнить выбранные дни', exact: true }).click();
+        await page.getByRole('button', { name: 'Сохранить всё', exact: true }).click();
+        await page.getByLabel('Действие', { exact: true }).waitFor();
+        assert.match(await page.locator('.adeo-schedule-conflict').textContent(), /Существующих правил: 2/);
+        await page.getByRole('button', { name: 'Подтвердить сохранение', exact: true }).click();
+        await page.getByRole('alert').filter({ hasText: 'Выберите действие' }).waitFor();
+        assert.equal(await page.evaluate(() => window.mutations.length), 0);
+        await page.getByRole('button', { name: 'Везде добавить', exact: true }).click();
+        await page.getByRole('button', { name: 'Подтвердить сохранение', exact: true }).click();
+        await page.getByRole('alert').filter({ hasText: 'уже существует' }).waitFor();
+        assert.equal(await page.evaluate(() => window.mutations.length), 0);
+        await page.getByRole('button', { name: 'Везде заменить', exact: true }).click();
+        await page.getByRole('button', { name: 'Подтвердить сохранение', exact: true }).click();
+        await page.getByRole('heading', { name: 'Расписание сохранено', exact: true }).waitFor();
+        const operations = await page.evaluate(() => window.mutations);
+        assert.deepEqual(operations.filter(item => item.type === 'remove').map(item => item.id), [1, 2]);
+        assert.equal(operations.filter(item => item.type === 'create').length, 1);
+        assert.equal(operations.at(-1).payload.nfile, null);
         assert.deepEqual(errors, []);
     } finally { await browser.close(); }
 });

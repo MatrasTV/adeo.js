@@ -8,7 +8,7 @@ const vm = require('node:vm');
 const names = ['scheduleDay', 'parseScheduleDay', 'addScheduleDays', 'scheduleWeekday', 'nextScheduleWeekday',
     'nextScheduleDelivery', 'scheduleTimestamp', 'scheduleHourLabel', 'scheduleEventToDraft', 'scheduleDraftPayload',
     'validateScheduleDraft', 'buildScheduleWeek', 'copyScheduleDrafts', 'findScheduleConflicts', 'makeSchedulePlan',
-    'createScheduleAdapter', 'runSchedulePlan', 'reconcileSchedulePlan', 'findScheduleProxy', 'scheduleFingerprint'];
+    'createScheduleAdapter', 'runSchedulePlan', 'reconcileSchedulePlan', 'findScheduleProxy', 'scheduleFingerprint', 'describeScheduleRequestError'];
 const source = readFileSync(resolve(__dirname, '../adeo.user.js'), 'utf8').replace(
     '    installLoadingProgress();', `    globalThis.calendar = { ${names.join(',')} }; return;`
 );
@@ -108,11 +108,33 @@ test('Замена выбирает будущий экземпляр каждо
     ]);
 });
 
-test('Общее правило с пустым складом заменяется отдельно от правил конкретных складов', () => {
+test('Все склады обнаруживает и заменяет общие и отдельные правила после выбора замены', () => {
     const plan = api.makeSchedulePlan([event(1, '2026-10-27', { nfile: null }), event(2, '2026-10-27')],
         [group('2026-10-27', [row('2026-10-27', { nfile: null })], [null])], { '2026-10-27': 'replace' }, 127, weekdays, '2026-10-26');
-    assert.equal(plan.operations.filter(operation => operation.type === 'remove').length, 1);
-    assert.equal(plan.operations[0].event.id, 1);
+    assert.deepEqual(Array.from(plan.operations.filter(operation => operation.type === 'remove'), operation => operation.event.id), [1, 2]);
+});
+
+test('Все склады обнаруживает конфликт даже при отсутствии записей с пустым складом', () => {
+    const events = [event(1, '2026-10-27'), event(2, '2026-10-27', { nfile: 8 })];
+    const groups = [group('2026-10-27', [row('2026-10-27', { nfile: null })], [null])];
+    assert.equal(api.findScheduleConflicts(events, groups)[0].count, 2);
+    assert.throws(() => api.makeSchedulePlan(events, groups, {}, 127, weekdays, '2026-10-26'), /Выберите действие/);
+    assert.throws(() => api.makeSchedulePlan(events, groups, { '2026-10-27': 'add' }, 127, weekdays, '2026-10-26'), /уже существует/);
+});
+
+test('Замена одного склада не удаляет общее правило остальных складов', () => {
+    const events = [event(1, '2026-10-27', { nfile: null })];
+    const groups = [group('2026-10-27', [row()])];
+    assert.equal(api.findScheduleConflicts(events, groups)[0].count, 1);
+    assert.throws(() => api.makeSchedulePlan(events, groups, { '2026-10-27': 'replace' }, 127, weekdays, '2026-10-26'), /нельзя удалить/);
+    assert.throws(() => api.makeSchedulePlan(events, groups, { '2026-10-27': 'add' }, 127, weekdays, '2026-10-26'), /уже существует/);
+});
+
+test('Черновик не допускает отправку всех складов и отдельного склада на одно время', () => {
+    const mixed = [group('2026-10-27', [row(), row('2026-10-27', { nfile: null })], [7, null])];
+    assert.throws(() => api.makeSchedulePlan([], mixed, {}, 127, weekdays, '2026-10-26'), /пересекающихся складов/);
+    const separate = [group('2026-10-27', [row(), row('2026-10-27', { nfile: 8 })], [7, 8])];
+    assert.equal(api.makeSchedulePlan([], separate, {}, 127, weekdays, '2026-10-26').operations.length, 2);
 });
 
 test('Нельзя сохранить неразрешённый конфликт, дубли или запись вне выбранного склада', () => {
@@ -190,6 +212,29 @@ test('Неподтверждённая операция остаётся заб�
     let calls = 0;
     await assert.rejects(api.runSchedulePlan(job, { async create() { calls++; } }, () => { throw new Error('Поставщик изменился'); }), /изменился/);
     assert.equal(calls, 0);
+});
+
+test('Отказ 417 показывает ответ CRM и параметры записи без служебных заголовков', async () => {
+    const payload = api.scheduleDraftPayload(row(tomorrow()), 127);
+    const error = { message: 'Request failed with status code 417', response: { status: 417,
+        data: { errors: [{ defaultMessage: 'Причина отказа от сервера' }] }, headers: { Authorization: 'секретный-заголовок' } },
+        config: { headers: { Cookie: 'секретный-cookie' } } };
+    const job = { operations: [{ type: 'create', payload }], index: 0, created: 0, deleted: 0, uncertain: false };
+    await assert.rejects(api.runSchedulePlan(job, { async create() { throw error; } }, () => {}), /HTTP 417/);
+    assert.match(job.error, /Причина отказа от сервера/);
+    assert.match(job.error, /Склад: 7/);
+    assert.match(job.error, /Отправка:/);
+    assert.equal(job.index, 0);
+    assert.equal(job.uncertain, true);
+    assert.doesNotMatch(job.error, /секретный|Authorization|Cookie/);
+});
+
+test('Диагностика поддерживает текстовый ответ и ошибку удаления', () => {
+    const text = api.describeScheduleRequestError({ response: { status: 417, data: 'Текст сервера' } }, { type: 'remove', event: event(1, tomorrow()) });
+    assert.match(text, /удалении/);
+    assert.match(text, /Текст сервера/);
+    const json = api.describeScheduleRequestError({ response: { status: 417, data: '{"message":"Описание отказа"}' } }, { type: 'create' });
+    assert.match(json, /Описание отказа/);
 });
 
 test('Сверка удаления проверяет все будущие экземпляры серии', async () => {
