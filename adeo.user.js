@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADEO — прайсы и расписание поставщиков
 // @namespace    admin.adeo.pro
-// @version      3.3.1
+// @version      3.3.2
 // @description  Работа с прайсами и мастер еженедельного расписания поставщиков CRM
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
@@ -1023,6 +1023,30 @@
         return { operations, skipped, index: 0, created: 0, deleted: 0, uncertain: false, error: '' };
     }
 
+    function makeScheduleClearPlan(events, supplierId, today = scheduleDay()) {
+        parseScheduleDay(today);
+        const weekly = new Map(), once = new Map();
+        let futureCount = 0;
+        for (const event of events) {
+            if (event.supplierId != null && String(event.supplierId) !== String(supplierId)) throw new Error('В расписании найдены записи другого поставщика. Очистка отменена.');
+            if (event.id === null || event.id === undefined) throw new Error('В записи отсутствует номер. Очистка отменена.');
+            if (scheduleDay(event.ordersAcceptedAt) <= today) continue;
+            futureCount++;
+            if (isWeeklySchedule(event)) {
+                const key = String(event.weeklyScheduleId);
+                const previous = weekly.get(key);
+                if (!previous || new Date(event.ordersAcceptedAt) < new Date(previous.ordersAcceptedAt)) weekly.set(key, event);
+            } else once.set(String(event.id), event);
+        }
+        const boundary = addScheduleDays(today, 1);
+        const operations = [
+            ...[...weekly.values()].map(event => ({ type: 'remove', event, future: true, boundary })),
+            ...[...once.values()].map(event => ({ type: 'remove', event, future: false, boundary }))
+        ].sort((a, b) => new Date(a.event.ordersAcceptedAt) - new Date(b.event.ordersAcceptedAt));
+        return { operations, skipped: 0, index: 0, created: 0, deleted: 0, uncertain: false, error: '',
+            clearing: true, supplierId, ruleCount: weekly.size, onceCount: once.size, futureCount };
+    }
+
     // Используем тот же объект $API, что и штатный CalendarEventEditor; адреса и авторизацию не дублируем.
     function createScheduleAdapter(proxy) {
         const native = proxy?.$API?.supplier?.schedule;
@@ -1152,7 +1176,7 @@
         const style = document.createElement('style');
         style.id = 'adeo-schedule-styles';
         style.textContent = `
-            .adeo-schedule-launch{border:1px solid #1976d2;border-radius:5px;background:#1976d2;color:#fff;padding:9px 14px;cursor:pointer;margin:4px 10px;font:inherit}
+            .adeo-schedule-launch,.adeo-schedule-clear{border:1px solid #1976d2;border-radius:5px;background:#1976d2;color:#fff;padding:9px 14px;cursor:pointer;margin:4px 10px;font:inherit}.adeo-schedule-clear{border-color:#b3261e;background:white;color:#b3261e}
             .adeo-schedule-overlay{position:fixed;inset:0;background:#101e35a6;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:20px;color:#223047;font:14px/1.45 Arial,sans-serif}
             .adeo-schedule-modal{background:#f5f7fb;width:min(1600px,98vw);max-height:94vh;display:flex;flex-direction:column;border-radius:12px;box-shadow:0 18px 70px #0005;overflow:hidden}
             .adeo-schedule-header{background:#1976d2;color:white;padding:15px 22px;display:flex;align-items:center;gap:16px}
@@ -1185,7 +1209,7 @@
         return element;
     }
 
-    async function openScheduleWizard(calendar, launcher) {
+    async function openScheduleWizard(calendar, launcher, initialMode = '') {
         if (document.querySelector('.adeo-schedule-overlay')) return;
         const proxy = findScheduleProxy(calendar);
         if (!proxy?.supplier?.id) { alert('Не удалось определить выбранного поставщика. Обновите CRM и снова откройте календарь.'); return; }
@@ -1194,7 +1218,7 @@
         installScheduleStyles();
         const supplierId = proxy.supplier.id;
         const state = {
-            phase: 'loading', mode: '', startDate: addScheduleDays(scheduleDay(), 1), sourceDate: addScheduleDays(scheduleDay(), 1),
+            phase: 'loading', mode: initialMode === 'clear' ? 'clear' : '', startDate: addScheduleDays(scheduleDay(), 1), sourceDate: addScheduleDays(scheduleDay(), 1),
             targetDate: addScheduleDays(scheduleDay(), 2), nfile: null, storages: [], orderDays: [0, 1, 2, 3, 4], deliveryDays: [0, 1, 2, 3, 4],
             template: [{ uid: String(++scheduleDraftSequence), sendTime: '09:00', leadDays: 1, deliveryHour: 15, haveDelivery: true }],
             groups: [], events: [], decisions: {}, snapshot: '', dirty: false, busy: false, error: '', job: null
@@ -1527,6 +1551,48 @@
             button(footer, 'Подтвердить сохранение', commitSave, 'primary');
         }
 
+        async function prepareClear() {
+            assertContext(); setBusy(true);
+            try {
+                const events = await adapter.list(supplierId);
+                makeScheduleClearPlan(events, supplierId);
+                state.events = events; state.snapshot = scheduleFingerprint(events);
+                state.mode = 'clear'; state.phase = 'clear-confirm';
+            } finally { setBusy(false); render(); }
+        }
+
+        function renderClearConfirm() {
+            const plan = makeScheduleClearPlan(state.events, supplierId);
+            content.append(scheduleElement('h3', 'Очистка всего будущего расписания'));
+            note(content, `Поставщик: ${proxy.supplier.cella || supplierId}. Все склады, начиная с ${addScheduleDays(scheduleDay(), 1)}.`);
+            note(content, 'Будут удалены разовые отправки и прекращены все показанные еженедельные повторы. Сегодняшние и прошедшие записи сохранятся.');
+            content.append(scheduleElement('p', `Еженедельных правил: ${plan.ruleCount}. Разовых записей: ${plan.onceCount}. Будущих отправок в загруженном расписании: ${plan.futureCount}.`, 'adeo-schedule-summary'));
+            for (const operation of plan.operations) {
+                const box = scheduleElement('div', null, 'adeo-schedule-box');
+                box.append(scheduleElement('strong', `${operation.future ? 'Повтор, начиная с ' : 'Разовая запись: '}${scheduleDay(operation.event.ordersAcceptedAt)}`));
+                note(box, describeEvent(operation.event)); content.append(box);
+            }
+            if (!plan.operations.length) note(content, 'В загруженном расписании нет будущих записей для удаления.');
+            button(footer, 'Отмена', close);
+            if (plan.operations.length) button(footer, 'Подтвердить очистку всех складов', commitClear, 'danger');
+        }
+
+        async function commitClear() {
+            assertContext();
+            const job = makeScheduleClearPlan(state.events, supplierId);
+            if (!job.operations.length) throw new Error('Будущих записей для удаления нет.');
+            setBusy(true);
+            try {
+                const latest = await adapter.list(supplierId);
+                if (scheduleFingerprint(latest) !== state.snapshot) {
+                    state.events = latest; state.snapshot = scheduleFingerprint(latest); render();
+                    throw new Error('Расписание изменилось после открытия окна очистки. Проверьте обновлённый список и подтвердите очистку заново.');
+                }
+                state.job = job; state.dirty = true; state.phase = 'saving'; render();
+                await executeJob();
+            } finally { setBusy(false); render(); }
+        }
+
         async function commitSave() {
             assertContext();
             const job = makeSchedulePlan(state.events, state.groups, state.decisions, supplierId, state.deliveryDays);
@@ -1545,8 +1611,14 @@
         async function executeJob() {
             try {
                 await runSchedulePlan(state.job, adapter, assertContext, renderProgress);
+                if (state.job.clearing) {
+                    const remaining = await adapter.list(supplierId);
+                    if (remaining.some(event => scheduleDay(event.ordersAcceptedAt) > scheduleDay())) {
+                        throw new Error('После очистки CRM всё ещё возвращает будущие записи. Очистка не подтверждена полностью. Проверьте результат; новые или оставшиеся записи автоматически не удаляются.');
+                    }
+                }
                 state.phase = 'done'; state.dirty = false;
-                try { await proxy.loadSchedules(); } catch { state.error = 'Записи сохранены, но календарь не обновился. Нажмите штатную кнопку обновления календаря.'; }
+                try { await proxy.loadSchedules(); } catch { state.error = 'Изменения выполнены, но календарь не обновился. Нажмите штатную кнопку обновления календаря.'; }
             } catch (error) { state.phase = 'failed'; state.error = error?.message || 'Не удалось завершить сохранение.'; }
         }
 
@@ -1558,7 +1630,10 @@
 
         function renderJob() {
             const job = state.job;
-            content.append(scheduleElement('h3', state.phase === 'done' ? 'Расписание сохранено' : state.phase === 'failed' ? 'Сохранение остановлено' : 'Сохранение расписания'));
+            const title = job.clearing
+                ? (state.phase === 'done' ? 'Будущее расписание очищено' : state.phase === 'failed' ? 'Очистка остановлена' : 'Очистка расписания')
+                : (state.phase === 'done' ? 'Расписание сохранено' : state.phase === 'failed' ? 'Сохранение остановлено' : 'Сохранение расписания');
+            content.append(scheduleElement('h3', title));
             const label = scheduleElement('p'); label.dataset.scheduleProgressLabel = ''; label.setAttribute('role', 'status'); label.setAttribute('aria-live', 'polite'); content.append(label);
             const progress = scheduleElement('progress', null, 'adeo-schedule-progress'); progress.max = job.operations.length || 1; progress.value = job.index; content.append(progress); renderProgress();
             if (job.skipped) note(content, `Одинаковых еженедельных правил уже было в CRM: ${job.skipped}. Повторно они не создавались.`);
@@ -1584,7 +1659,8 @@
                 for (const [mode, title, description] of [['copy', 'Скопировать день', 'Перенести все еженедельные записи конкретного дня на другую дату.'], ['new', 'Заполнить с нуля', 'Выбрать дни, заполнить один день и подготовить всю неделю.']]) {
                     const node = button(modes, title, () => { state.mode = mode; state.phase = 'setup'; render(); }, 'primary'); node.append(scheduleElement('small', description));
                 }
-                content.append(modes); return;
+                content.append(modes);
+                button(content, 'Очистить всё расписание', prepareClear, 'danger'); return;
             }
             if (state.phase === 'setup') { button(footer, 'Назад', () => { state.phase = 'choose'; render(); }); renderSetup(); }
             else if (state.phase === 'template') {
@@ -1600,6 +1676,7 @@
                 }, 'primary');
             } else if (state.phase === 'review') renderReview();
             else if (state.phase === 'confirm') renderConfirm();
+            else if (state.phase === 'clear-confirm') renderClearConfirm();
             else renderJob();
         }
         render();
@@ -1607,13 +1684,15 @@
             assertContext();
             state.events = await adapter.list(supplierId);
             state.storages = Array.isArray(proxy.storages) ? [...proxy.storages] : [];
-            if (!state.storages.length && typeof proxy.$svcPlatformV1Client === 'function') {
+            if (state.mode !== 'clear' && !state.storages.length && typeof proxy.$svcPlatformV1Client === 'function') {
                 const response = await proxy.$svcPlatformV1Client({ url: '/b2b/supplier/storage/search', method: 'POST', data: { isDisabled: false, supplierId } });
                 if (!Array.isArray(response?.data?.content)) throw new Error('CRM вернула неизвестный список складов.');
                 state.storages = response.data.content;
             }
             state.storages = state.storages.filter(storage => storage.nfile !== null && storage.nfile !== undefined);
-            state.phase = 'choose';
+            if (state.mode === 'clear') {
+                makeScheduleClearPlan(state.events, supplierId); state.snapshot = scheduleFingerprint(state.events); state.phase = 'clear-confirm';
+            } else state.phase = 'choose';
         } catch (error) { state.phase = 'load-error'; state.error = error.message; }
         if (overlay.isConnected) render();
     }
@@ -1622,11 +1701,18 @@
         function update() {
             if (!/^\/supplier\/supplier-list\/?$/.test(window.location.pathname)) return;
             document.querySelectorAll('.work-calendar').forEach(calendar => {
-                if (calendar.querySelector('.adeo-schedule-launch')) return;
                 const toolbar = calendar.querySelector('.row'); if (!toolbar) return;
-                const button = scheduleElement('button', 'Мастер расписания', 'adeo-schedule-launch'); button.type = 'button';
-                button.addEventListener('click', () => openScheduleWizard(calendar, button).catch(error => alert(error.message)));
-                toolbar.append(button);
+                installScheduleStyles();
+                if (!calendar.querySelector('.adeo-schedule-launch')) {
+                    const button = scheduleElement('button', 'Мастер расписания', 'adeo-schedule-launch'); button.type = 'button';
+                    button.addEventListener('click', () => openScheduleWizard(calendar, button).catch(error => alert(error.message)));
+                    toolbar.append(button);
+                }
+                if (!calendar.querySelector('.adeo-schedule-clear')) {
+                    const button = scheduleElement('button', 'Очистить всё расписание', 'adeo-schedule-clear'); button.type = 'button';
+                    button.addEventListener('click', () => openScheduleWizard(calendar, button, 'clear').catch(error => alert(error.message)));
+                    toolbar.append(button);
+                }
             });
         }
         const observer = new MutationObserver(mutations => {

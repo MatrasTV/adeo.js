@@ -276,3 +276,89 @@ test('Заполнение с нуля для всех складов предл
         assert.deepEqual(errors, []);
     } finally { await browser.close(); }
 });
+
+async function seedClear(page, dates) {
+    await page.evaluate(({ source, target }) => {
+        const today = new Date();
+        const day = value => `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
+        const before = new Date(today); before.setDate(before.getDate() - 7);
+        const later = new Date(`${source}T12:00:00`); later.setDate(later.getDate() + 7);
+        const entry = (id, date, nfile, weeklyScheduleId) => ({ id, supplierId: 127, nfile, weeklyScheduleId,
+            ordersAcceptedAt: `${date}T09:00:00+03:00`, orderDeliveryIntervalStart: null, orderDeliveryIntervalEnd: null });
+        window.events = [entry(1, day(before), 7, 100), entry(2, day(today), 7, 100), entry(3, source, 7, 100),
+            entry(4, day(later), 7, 100), entry(5, target, null, 0), entry(6, source, 8, 200), entry(7, day(before), null, 0)];
+    }, dates);
+}
+
+test('Очистка требует подтверждения, удаляет будущее расписание всех складов и сохраняет историю', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 45000
+}, async () => {
+    const { browser, page, dates, errors } = await fixture();
+    try {
+        await seedClear(page, dates);
+        await page.getByRole('button', { name: 'Очистить всё расписание', exact: true }).click();
+        await page.getByRole('heading', { name: 'Очистка всего будущего расписания', exact: true }).waitFor();
+        assert.match(await page.locator('.adeo-schedule-summary').textContent(), /Еженедельных правил: 2.*Разовых записей: 1.*отправок.*4/);
+        assert.equal(await page.evaluate(() => window.mutations.length), 0);
+        await page.getByRole('button', { name: 'Отмена', exact: true }).click();
+        assert.equal(await page.locator('.adeo-schedule-overlay').count(), 0);
+        assert.equal(await page.evaluate(() => window.mutations.length), 0);
+        await page.getByRole('button', { name: 'Очистить всё расписание', exact: true }).click();
+        await page.getByRole('button', { name: 'Подтвердить очистку всех складов', exact: true }).click();
+        await page.getByRole('heading', { name: 'Будущее расписание очищено', exact: true }).waitFor();
+        const data = await page.evaluate(() => ({ events: window.events, mutations: window.mutations, refreshed: window.refreshed }));
+        assert.deepEqual(data.mutations.map(item => [item.type, item.id, item.future]), [['remove', 3, true], ['remove', 6, true], ['remove', 5, false]]);
+        assert.deepEqual(data.events.map(item => item.id), [1, 2, 7]);
+        assert.equal(data.refreshed, 1);
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
+test('При изменении расписания очистка требует нового подтверждения', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 45000
+}, async () => {
+    const { browser, page, dates, errors } = await fixture();
+    try {
+        await seedClear(page, dates);
+        await page.getByRole('button', { name: 'Очистить всё расписание', exact: true }).click();
+        await page.getByRole('button', { name: 'Подтвердить очистку всех складов', exact: true }).waitFor();
+        await page.evaluate(() => { window.events.push({ ...window.events[4], id: 8 }); });
+        await page.getByRole('button', { name: 'Подтвердить очистку всех складов', exact: true }).click();
+        await page.getByRole('alert').filter({ hasText: 'Расписание изменилось' }).waitFor();
+        assert.equal(await page.evaluate(() => window.mutations.length), 0);
+        assert.match(await page.locator('.adeo-schedule-summary').textContent(), /Разовых записей: 2/);
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
+test('Очистка из мастера не отправляет запросы при отсутствии будущих записей', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 45000
+}, async () => {
+    const { browser, page, errors } = await fixture();
+    try {
+        await page.getByRole('button', { name: 'Мастер расписания', exact: true }).click();
+        const modal = page.getByRole('dialog');
+        await modal.getByRole('button', { name: 'Очистить всё расписание', exact: true }).click();
+        await page.getByRole('heading', { name: 'Очистка всего будущего расписания', exact: true }).waitFor();
+        assert.equal(await page.getByRole('button', { name: 'Подтвердить очистку всех складов', exact: true }).count(), 0);
+        assert.equal(await page.evaluate(() => window.mutations.length), 0);
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
+test('Очистка не сообщает об успехе, если CRM продолжает возвращать будущие записи', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 45000
+}, async () => {
+    const { browser, page, dates, errors } = await fixture();
+    try {
+        await seedClear(page, dates);
+        await page.evaluate(() => { window.calendarProxy.$API.supplier.schedule.remove = async () => ({ data: true }); });
+        await page.getByRole('button', { name: 'Очистить всё расписание', exact: true }).click();
+        await page.getByRole('button', { name: 'Подтвердить очистку всех складов', exact: true }).click();
+        await page.getByRole('heading', { name: 'Очистка остановлена', exact: true }).waitFor();
+        assert.match(await page.getByRole('alert').textContent(), /Очистка не подтверждена полностью/);
+        assert.equal(await page.getByRole('heading', { name: 'Будущее расписание очищено', exact: true }).count(), 0);
+        assert.equal(await page.evaluate(() => window.refreshed), 0);
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});

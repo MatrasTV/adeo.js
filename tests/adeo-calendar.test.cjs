@@ -8,7 +8,7 @@ const vm = require('node:vm');
 const names = ['scheduleDay', 'parseScheduleDay', 'addScheduleDays', 'scheduleWeekday', 'nextScheduleWeekday',
     'nextScheduleDelivery', 'scheduleTimestamp', 'scheduleHourLabel', 'scheduleEventToDraft', 'scheduleDraftPayload',
     'validateScheduleDraft', 'buildScheduleWeek', 'copyScheduleDrafts', 'findScheduleConflicts', 'makeSchedulePlan',
-    'createScheduleAdapter', 'runSchedulePlan', 'reconcileSchedulePlan', 'findScheduleProxy', 'scheduleFingerprint', 'describeScheduleRequestError'];
+    'createScheduleAdapter', 'runSchedulePlan', 'reconcileSchedulePlan', 'findScheduleProxy', 'scheduleFingerprint', 'describeScheduleRequestError', 'makeScheduleClearPlan'];
 const source = readFileSync(resolve(__dirname, '../adeo.user.js'), 'utf8').replace(
     '    installLoadingProgress();', `    globalThis.calendar = { ${names.join(',')} }; return;`
 );
@@ -259,4 +259,59 @@ test('Снимок расписания не зависит от порядка 
     const a = event(1, '2026-10-27'), b = event(2, '2026-10-28');
     assert.equal(api.scheduleFingerprint([a, b]), api.scheduleFingerprint([b, a]));
     assert.notEqual(api.scheduleFingerprint([a]), api.scheduleFingerprint([{ ...a, nfile: 8 }]));
+});
+
+test('Очистка охватывает все склады, удаляет повтор один раз и сохраняет сегодняшние и прошлые записи', () => {
+    const today = '2026-10-26';
+    const events = [
+        event(1, '2026-10-19', { weeklyScheduleId: 77 }), event(2, today, { weeklyScheduleId: 77 }),
+        event(3, '2026-10-27', { weeklyScheduleId: 88 }), event(4, '2026-11-03', { weeklyScheduleId: 88 }),
+        event(5, '2026-11-02', { weeklyScheduleId: 77 }), event(6, '2026-10-28', { weeklyScheduleId: 0, nfile: null }),
+        event(7, today, { weeklyScheduleId: 0 }), event(8, '2026-10-25', { weeklyScheduleId: 0 }),
+        event(9, '2026-10-27', { weeklyScheduleId: 99, nfile: 8 })
+    ];
+    const job = api.makeScheduleClearPlan(events, 127, today);
+    assert.equal(job.clearing, true);
+    assert.equal(job.ruleCount, 3);
+    assert.equal(job.onceCount, 1);
+    assert.equal(job.futureCount, 5);
+    assert.deepEqual(Array.from(job.operations, operation => [operation.event.id, operation.future]), [[3, true], [9, true], [6, false], [5, true]]);
+    assert.ok(job.operations.every(operation => operation.type === 'remove' && operation.boundary === '2026-10-27'));
+});
+
+test('Очистка пустого или исторического расписания не создаёт запросов удаления', () => {
+    assert.equal(api.makeScheduleClearPlan([], 127, '2026-10-26').operations.length, 0);
+    const job = api.makeScheduleClearPlan([event(1, '2026-10-26'), event(2, '2026-10-19')], 127, '2026-10-26');
+    assert.equal(job.operations.length, 0);
+    assert.equal(job.futureCount, 0);
+});
+
+test('Очистка отклоняет записи другого поставщика и неполные данные до выполнения операций', () => {
+    assert.throws(() => api.makeScheduleClearPlan([event(1, '2026-10-27', { supplierId: 128 })], 127, '2026-10-26'), /другого поставщика/);
+    assert.throws(() => api.makeScheduleClearPlan([event(1, '2026-10-27', { id: null })], 127, '2026-10-26'), /отсутствует номер/);
+    assert.throws(() => api.makeScheduleClearPlan([event(1, '2026-10-27', { ordersAcceptedAt: 'ошибка' })], 127, '2026-10-26'), /некорректную дату/);
+});
+
+test('Очистка после потери ответа сверяет удаление и не отправляет его повторно', async () => {
+    const today = api.scheduleDay(), date = tomorrow();
+    const history = event(1, api.addScheduleDays(today, -7), { weeklyScheduleId: 70 });
+    let events = [history, event(2, date, { weeklyScheduleId: 70 }), event(3, api.addScheduleDays(date, 7), { weeklyScheduleId: 70 }),
+        event(4, date, { weeklyScheduleId: 0, nfile: null })];
+    const job = api.makeScheduleClearPlan(events, 127, today);
+    const calls = [];
+    const adapter = {
+        async remove(target, future) {
+            calls.push([target.id, future]);
+            events = events.filter(item => future ? item.weeklyScheduleId !== target.weeklyScheduleId ||
+                item.ordersAcceptedAt < target.ordersAcceptedAt : item.id !== target.id);
+            if (calls.length === 1) throw new Error('Ответ удаления потерян');
+        },
+        async list() { return events; }
+    };
+    await assert.rejects(api.runSchedulePlan(job, adapter, () => {}), /Ответ удаления потерян/);
+    assert.equal(await api.reconcileSchedulePlan(job, adapter, 127), true);
+    await api.runSchedulePlan(job, adapter, () => {});
+    assert.deepEqual(calls, [[2, true], [4, false]]);
+    assert.equal(job.deleted, 2);
+    assert.deepEqual(events.map(item => item.id), [1]);
 });
