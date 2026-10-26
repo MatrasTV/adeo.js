@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         ADEO — инструменты работы с прайсами
+// @name         ADEO — прайсы и расписание поставщиков
 // @namespace    admin.adeo.pro
-// @version      3.2.0
-// @description  Анализ продаваемости, пересечения, сроки, копирование и оформление статусов импорта
+// @version      3.3.0
+// @description  Работа с прайсами и мастер еженедельного расписания поставщиков CRM
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
 // @homepageURL  https://github.com/MatrasTV/adeo.js
@@ -13,6 +13,7 @@
 // @match        https://admin.adeo.pro/admin/admin_pricerelevance/list*
 // @match        https://admin.adeo.pro/admin/supplier/price/compare/*
 // @match        https://admin.adeo.pro/admin/supplier/price/comparemode/*
+// @match        https://crm.adeo.pro/*
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
@@ -768,11 +769,831 @@
         });
     }
 
+    // Календарные дни считаем отдельно от времени: переход часового пояса не меняет срок доставки.
+    const SCHEDULE_WEEKDAYS = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье'];
+    let scheduleDraftSequence = 0;
+    const schedulePad = value => String(value).padStart(2, '0');
+
+    function scheduleDay(value = new Date()) {
+        const date = value instanceof Date ? value : new Date(value);
+        if (!Number.isFinite(date.getTime())) throw new Error('CRM вернула некорректную дату.');
+        return `${date.getFullYear()}-${schedulePad(date.getMonth() + 1)}-${schedulePad(date.getDate())}`;
+    }
+
+    function parseScheduleDay(value) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(value || '')) throw new Error('Укажите дату полностью.');
+        const date = new Date(`${value}T12:00:00Z`);
+        if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== value) throw new Error('Некорректная дата.');
+        return date;
+    }
+
+    function addScheduleDays(value, amount) {
+        if (!Number.isInteger(amount)) throw new Error('Срок доставки должен быть целым числом дней.');
+        const date = parseScheduleDay(value);
+        date.setUTCDate(date.getUTCDate() + amount);
+        return date.toISOString().slice(0, 10);
+    }
+
+    function scheduleWeekday(value) {
+        return (parseScheduleDay(value).getUTCDay() + 6) % 7;
+    }
+
+    function nextScheduleWeekday(start, weekday) {
+        return addScheduleDays(start, (weekday - scheduleWeekday(start) + 7) % 7);
+    }
+
+    function nextScheduleDelivery(day, allowedDays) {
+        const allowed = new Set(allowedDays.filter(value => Number.isInteger(value) && value >= 0 && value < 6));
+        if (!allowed.size) throw new Error('Выберите хотя бы один день доставки с понедельника по субботу.');
+        for (let offset = 0; offset < 7; offset++) {
+            const candidate = addScheduleDays(day, offset);
+            if (allowed.has(scheduleWeekday(candidate))) return candidate;
+        }
+        throw new Error('Не удалось подобрать день доставки.');
+    }
+
+    function scheduleTime(value) {
+        const date = new Date(value);
+        if (!Number.isFinite(date.getTime())) throw new Error('CRM вернула некорректное время.');
+        return `${schedulePad(date.getHours())}:${schedulePad(date.getMinutes())}`;
+    }
+
+    function scheduleTimestamp(day, time) {
+        parseScheduleDay(day);
+        if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time || '')) throw new Error('Укажите время в формате ЧЧ:ММ.');
+        const date = new Date(`${day}T${time}:00`);
+        if (scheduleDay(date) !== day || scheduleTime(date) !== time) throw new Error('Это местное время недоступно из-за перевода часов.');
+        const offset = -date.getTimezoneOffset();
+        return `${day}T${time}:00${offset >= 0 ? '+' : '-'}${schedulePad(Math.floor(Math.abs(offset) / 60))}:${schedulePad(Math.abs(offset) % 60)}`;
+    }
+
+    function scheduleHourLabel(hour) {
+        return `${schedulePad(hour)}:00–${hour === 23 ? '23:59' : `${schedulePad(hour + 1)}:00`}`;
+    }
+
+    function scheduleNfile(value) {
+        return value === null || value === undefined || value === '' ? '' : String(value);
+    }
+
+    function isWeeklySchedule(event) {
+        return Boolean(event.weeklyScheduleId) && String(event.weeklyScheduleId) !== '0';
+    }
+
+    function scheduleEventToDraft(event, offset = 0) {
+        const hasStart = Boolean(event.orderDeliveryIntervalStart);
+        const hasEnd = Boolean(event.orderDeliveryIntervalEnd);
+        if (hasStart !== hasEnd) throw new Error('В записи CRM неполный интервал доставки. Исправьте её штатной формой.');
+        const deliveryTime = hasStart ? scheduleTime(event.orderDeliveryIntervalStart) : '15:00';
+        const hour = Number(deliveryTime.slice(0, 2));
+        if (hasStart && (deliveryTime !== `${schedulePad(hour)}:00` ||
+            scheduleTime(event.orderDeliveryIntervalEnd) !== (hour === 23 ? '23:59' : `${schedulePad(hour + 1)}:00`) ||
+            scheduleDay(event.orderDeliveryIntervalStart) !== scheduleDay(event.orderDeliveryIntervalEnd))) {
+            throw new Error('В CRM найден нестандартный интервал доставки. Исправьте его штатной формой перед копированием.');
+        }
+        return {
+            uid: String(++scheduleDraftSequence), nfile: event.nfile ?? null,
+            sendDate: addScheduleDays(scheduleDay(event.ordersAcceptedAt), offset), sendTime: scheduleTime(event.ordersAcceptedAt),
+            haveDelivery: hasStart, deliveryDate: hasStart ? addScheduleDays(scheduleDay(event.orderDeliveryIntervalStart), offset) : '',
+            deliveryHour: hour
+        };
+    }
+
+    function scheduleDraftPayload(draft, supplierId) {
+        const start = draft.haveDelivery ? `${schedulePad(draft.deliveryHour)}:00` : null;
+        const end = draft.haveDelivery ? (draft.deliveryHour === 23 ? '23:59' : `${schedulePad(draft.deliveryHour + 1)}:00`) : null;
+        return {
+            supplierId, nfile: scheduleNfile(draft.nfile) === '' ? null : draft.nfile, repeatWeekly: true,
+            ordersAcceptedAt: scheduleTimestamp(draft.sendDate, draft.sendTime),
+            orderDeliveryIntervalStart: start ? scheduleTimestamp(draft.deliveryDate, start) : null,
+            orderDeliveryIntervalEnd: end ? scheduleTimestamp(draft.deliveryDate, end) : null
+        };
+    }
+
+    function validateScheduleDraft(draft, allowedDays, today = scheduleDay()) {
+        const errors = [];
+        try {
+            parseScheduleDay(draft.sendDate);
+            if (draft.sendDate <= today) errors.push('Отправку можно назначить только на будущий день.');
+            scheduleTimestamp(draft.sendDate, draft.sendTime);
+            if (draft.haveDelivery) {
+                parseScheduleDay(draft.deliveryDate);
+                const weekday = scheduleWeekday(draft.deliveryDate);
+                if (weekday === 6) errors.push('В воскресенье ваш склад закрыт.');
+                else if (!allowedDays.includes(weekday)) errors.push('Поставщик не доставляет в выбранный день недели.');
+                if (!Number.isInteger(draft.deliveryHour) || draft.deliveryHour < 0 || draft.deliveryHour > 23) errors.push('Выберите часовой интервал доставки.');
+                else {
+                    if (weekday === 5 && draft.deliveryHour > 15) errors.push('В субботу выберите интервал не позднее 15:00–16:00.');
+                    if (`${draft.deliveryDate}T${schedulePad(draft.deliveryHour)}:00` < `${draft.sendDate}T${draft.sendTime}`) errors.push('Доставка не может начинаться раньше отправки.');
+                }
+            }
+        } catch (error) { errors.push(error.message); }
+        return errors;
+    }
+
+    function buildScheduleWeek(template, orderDays, deliveryDays, startDate, nfile) {
+        parseScheduleDay(startDate);
+        if (!orderDays.length) throw new Error('Выберите дни отправки заказов.');
+        if (!template.length) throw new Error('Добавьте хотя бы одну отправку в шаблон.');
+        for (const row of template) {
+            if (!Number.isInteger(row.leadDays) || row.leadDays < 0) throw new Error('Срок доставки — целое неотрицательное число дней.');
+        }
+        return SCHEDULE_WEEKDAYS.map((name, weekday) => {
+            const date = nextScheduleWeekday(startDate, weekday);
+            const enabled = orderDays.includes(weekday);
+            return { date, weekday, enabled, nfiles: [nfile], entries: enabled ? template.map(row => ({
+                uid: String(++scheduleDraftSequence), nfile, sendDate: date, sendTime: row.sendTime,
+                haveDelivery: row.haveDelivery, deliveryDate: row.haveDelivery ? nextScheduleDelivery(addScheduleDays(date, row.leadDays), deliveryDays) : '',
+                deliveryHour: row.deliveryHour
+            })) : [] };
+        });
+    }
+
+    function copyScheduleDrafts(entries, sourceDate, targetDate) {
+        const offset = (parseScheduleDay(targetDate) - parseScheduleDay(sourceDate)) / 86400000;
+        return entries.map(row => ({ ...row, uid: String(++scheduleDraftSequence), sendDate: addScheduleDays(row.sendDate, offset),
+            deliveryDate: row.haveDelivery ? addScheduleDays(row.deliveryDate, offset) : '' }));
+    }
+
+    // Сравниваем именно поля расписания, чтобы порядок ответа сервера не создавал ложных конфликтов.
+    function scheduleFingerprint(events) {
+        return JSON.stringify(events.map(event => [String(event.id), String(event.weeklyScheduleId || ''), scheduleNfile(event.nfile),
+            event.ordersAcceptedAt, event.orderDeliveryIntervalStart || null, event.orderDeliveryIntervalEnd || null]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))));
+    }
+
+    function scheduleRecordSignature(event) {
+        return JSON.stringify([scheduleNfile(event.nfile), new Date(event.ordersAcceptedAt).getTime(),
+            event.orderDeliveryIntervalStart ? new Date(event.orderDeliveryIntervalStart).getTime() : null,
+            event.orderDeliveryIntervalEnd ? new Date(event.orderDeliveryIntervalEnd).getTime() : null]);
+    }
+
+    function scheduleRepeatSignature(event) {
+        const day = scheduleDay(event.ordersAcceptedAt);
+        return JSON.stringify([scheduleNfile(event.nfile), scheduleWeekday(day), scheduleTime(event.ordersAcceptedAt),
+            event.orderDeliveryIntervalStart ? (parseScheduleDay(scheduleDay(event.orderDeliveryIntervalStart)) - parseScheduleDay(day)) / 86400000 : null,
+            event.orderDeliveryIntervalStart ? scheduleTime(event.orderDeliveryIntervalStart) : null,
+            event.orderDeliveryIntervalEnd ? (parseScheduleDay(scheduleDay(event.orderDeliveryIntervalEnd)) - parseScheduleDay(day)) / 86400000 : null,
+            event.orderDeliveryIntervalEnd ? scheduleTime(event.orderDeliveryIntervalEnd) : null]);
+    }
+
+    function findScheduleConflicts(events, groups) {
+        return groups.filter(group => group.enabled).map(group => {
+            const scopes = new Set(group.nfiles.map(scheduleNfile));
+            const series = new Map();
+            const once = [];
+            for (const event of events) {
+                if (!scopes.has(scheduleNfile(event.nfile))) continue;
+                const day = scheduleDay(event.ordersAcceptedAt);
+                if (isWeeklySchedule(event) && scheduleWeekday(day) === scheduleWeekday(group.date)) {
+                    const key = String(event.weeklyScheduleId);
+                    if (!series.has(key)) series.set(key, []);
+                    series.get(key).push(event);
+                } else if (!isWeeklySchedule(event) && day === group.date) once.push(event);
+            }
+            const weekly = [...series.values()].map(instances => ({
+                instances, first: instances.filter(event => scheduleDay(event.ordersAcceptedAt) >= group.date)
+                    .sort((a, b) => new Date(a.ordersAcceptedAt) - new Date(b.ordersAcceptedAt))[0]
+            }));
+            return { group, weekly, once, count: weekly.length + once.length };
+        });
+    }
+
+    function makeSchedulePlan(events, groups, decisions, supplierId, deliveryDays, today = scheduleDay()) {
+        const operations = [];
+        let skipped = 0;
+        const conflicts = findScheduleConflicts(events, groups);
+        const removed = new Set();
+        for (const conflict of conflicts) {
+            const { group, weekly, once, count } = conflict;
+            if (group.date <= today) throw new Error('Дата начала уже наступила. Выберите будущую дату.');
+            const decision = count ? decisions[group.date] : 'add';
+            if (decision === 'skip') continue;
+            if (decision !== 'add' && decision !== 'replace') throw new Error('Выберите действие для каждого заполненного дня.');
+            const slots = new Set();
+            for (const row of group.entries) {
+                if (row.sendDate !== group.date || !group.nfiles.some(value => scheduleNfile(value) === scheduleNfile(row.nfile))) throw new Error('Запись оказалась вне выбранного дня или склада.');
+                const errors = validateScheduleDraft(row, deliveryDays, today);
+                if (errors.length) throw new Error(`${group.date}: ${errors.join(' ')}`);
+                const slot = JSON.stringify([scheduleNfile(row.nfile), row.sendTime]);
+                if (slots.has(slot)) throw new Error(`${group.date}: две отправки одного склада назначены на ${row.sendTime}.`);
+                slots.add(slot);
+            }
+            if (decision === 'replace') {
+                for (const series of weekly) {
+                    if (!series.first) throw new Error(`${group.date}: CRM пока не загрузила будущий экземпляр повтора. Замену выполнить нельзя; выберите более близкую дату или добавление.`);
+                    const key = `weekly:${series.first.weeklyScheduleId}`;
+                    if (!removed.has(key)) {
+                        removed.add(key);
+                        operations.push({ type: 'remove', event: series.first, future: true, boundary: group.date });
+                    }
+                }
+                for (const event of once) {
+                    const key = `once:${event.id}`;
+                    if (!removed.has(key)) { removed.add(key); operations.push({ type: 'remove', event, future: false, boundary: group.date }); }
+                }
+            }
+            for (const draft of group.entries) {
+                const payload = scheduleDraftPayload(draft, supplierId);
+                if (decision === 'add') {
+                    const sameWeeklySlot = weekly.filter(series => series.instances.some(event =>
+                        scheduleNfile(event.nfile) === scheduleNfile(draft.nfile) && scheduleTime(event.ordersAcceptedAt) === draft.sendTime));
+                    const identical = sameWeeklySlot.some(series => series.first && series.instances.some(event =>
+                        scheduleDay(event.ordersAcceptedAt) <= group.date && scheduleRepeatSignature(event) === scheduleRepeatSignature(payload)));
+                    if (identical) { skipped++; continue; }
+                    if (sameWeeklySlot.length || once.some(event => scheduleNfile(event.nfile) === scheduleNfile(draft.nfile) && scheduleTime(event.ordersAcceptedAt) === draft.sendTime)) {
+                        throw new Error(`${group.date}, ${draft.sendTime}: отправка этого склада уже существует. Выберите «Заменить» или другое время.`);
+                    }
+                }
+                operations.push({ type: 'create', payload });
+            }
+        }
+        return { operations, skipped, index: 0, created: 0, deleted: 0, uncertain: false, error: '' };
+    }
+
+    // Используем тот же объект $API, что и штатный CalendarEventEditor; адреса и авторизацию не дублируем.
+    function createScheduleAdapter(proxy) {
+        const native = proxy?.$API?.supplier?.schedule;
+        if (!native || !['list', 'create', 'remove'].every(name => typeof native[name] === 'function')) throw new Error('Не удалось подключиться к штатным функциям календаря CRM. Обновите страницу.');
+        return {
+            async list(supplierId) {
+                const response = await native.list(supplierId);
+                if (!Array.isArray(response?.data)) throw new Error('CRM вернула неизвестный формат расписания. Изменения не отправлены.');
+                for (const event of response.data) {
+                    if (event.id === undefined || event.id === null) throw new Error('В ответе CRM отсутствует номер записи.');
+                    scheduleDay(event.ordersAcceptedAt);
+                    if (event.supplierId != null && String(event.supplierId) !== String(supplierId)) throw new Error('CRM вернула расписание другого поставщика.');
+                }
+                return response.data;
+            },
+            async create(payload) { return await native.create(payload); },
+            async remove(event, future) { return await native.remove(event.id, future); }
+        };
+    }
+
+    async function runSchedulePlan(job, adapter, checkContext, onProgress = () => {}) {
+        if (job.uncertain) throw new Error('Сначала проверьте результат прерванной операции.');
+        while (job.index < job.operations.length) {
+            checkContext();
+            const operation = job.operations[job.index];
+            const date = operation.type === 'create' ? scheduleDay(operation.payload.ordersAcceptedAt) : scheduleDay(operation.event.ordersAcceptedAt);
+            if (date <= scheduleDay()) throw new Error('Наступил день одной из отправок. Обновите даты перед продолжением.');
+            try {
+                if (operation.type === 'create') { await adapter.create(operation.payload); job.created++; }
+                else { await adapter.remove(operation.event, operation.future); job.deleted++; }
+                job.index++;
+                onProgress(job);
+            } catch (error) {
+                job.uncertain = true;
+                job.error = error?.message || 'CRM не подтвердила выполнение операции.';
+                onProgress(job);
+                throw error;
+            }
+        }
+        return job;
+    }
+
+    async function reconcileSchedulePlan(job, adapter, supplierId) {
+        if (!job.uncertain) return true;
+        const events = await adapter.list(supplierId);
+        const operation = job.operations[job.index];
+        const complete = operation.type === 'create'
+            ? events.some(event => isWeeklySchedule(event) && scheduleRecordSignature(event) === scheduleRecordSignature(operation.payload))
+            : !events.some(event => operation.future
+                ? String(event.weeklyScheduleId) === String(operation.event.weeklyScheduleId) && scheduleDay(event.ordersAcceptedAt) >= operation.boundary
+                : String(event.id) === String(operation.event.id));
+        if (!complete) return false;
+        if (operation.type === 'create') job.created++;
+        else job.deleted++;
+        job.index++;
+        job.uncertain = false;
+        job.error = '';
+        return true;
+    }
+
+    function findScheduleProxy(element) {
+        const isCalendar = instance => {
+            const proxy = instance?.proxy;
+            return proxy && (instance.type?.name === 'WorkCalendarQuasar' || proxy.$options?.name === 'WorkCalendarQuasar') &&
+                (proxy.$el === element || proxy.$el?.contains?.(element)) ? proxy : null;
+        };
+        for (let node = element; node; node = node.parentElement) {
+            for (let instance = node.__vueParentComponent; instance; instance = instance.parent) {
+                const proxy = isCalendar(instance);
+                if (proxy) return proxy;
+            }
+        }
+        const app = document.querySelector('#q-app')?.__vue_app__;
+        const queue = [app?._container?._vnode, app?._instance?.vnode];
+        const visited = new Set();
+        // Обход дерева VNode работает и в сборке Vue без средств разработчика.
+        while (queue.length) {
+            const vnode = queue.pop();
+            if (!vnode || typeof vnode !== 'object' || visited.has(vnode)) continue;
+            visited.add(vnode);
+            if (Array.isArray(vnode)) { queue.push(...vnode); continue; }
+            const proxy = isCalendar(vnode.component);
+            if (proxy) return proxy;
+            queue.push(vnode.component?.subTree, vnode.children, vnode.suspense?.activeBranch);
+        }
+        return null;
+    }
+
+    function installScheduleStyles() {
+        if (document.getElementById('adeo-schedule-styles')) return;
+        const style = document.createElement('style');
+        style.id = 'adeo-schedule-styles';
+        style.textContent = `
+            .adeo-schedule-launch{border:1px solid #1976d2;border-radius:5px;background:#1976d2;color:#fff;padding:9px 14px;cursor:pointer;margin:4px 10px;font:inherit}
+            .adeo-schedule-overlay{position:fixed;inset:0;background:#101e35a6;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:20px;color:#223047;font:14px/1.45 Arial,sans-serif}
+            .adeo-schedule-modal{background:#f5f7fb;width:min(1600px,98vw);max-height:94vh;display:flex;flex-direction:column;border-radius:12px;box-shadow:0 18px 70px #0005;overflow:hidden}
+            .adeo-schedule-header{background:#1976d2;color:white;padding:15px 22px;display:flex;align-items:center;gap:16px}
+            .adeo-schedule-header h2{font:600 20px/1.3 Arial;margin:0;flex:1;color:inherit}.adeo-schedule-close{background:transparent;color:white;border:0;font-size:25px;cursor:pointer;padding:3px 10px}
+            .adeo-schedule-content{padding:22px;overflow:auto;min-height:160px}.adeo-schedule-footer{padding:14px 22px;display:flex;gap:10px;justify-content:flex-end;border-top:1px solid #dce3ee;background:white;flex-wrap:wrap}
+            .adeo-schedule-overlay button,.adeo-schedule-overlay input,.adeo-schedule-overlay select{font:inherit;box-sizing:border-box}
+            .adeo-schedule-button{background:white;border:1px solid #bdcadd;border-radius:5px;color:#223047;padding:8px 12px;cursor:pointer}.adeo-schedule-button.primary{background:#1976d2;color:white;border-color:#1976d2}.adeo-schedule-button.danger{color:#b3261e}
+            .adeo-schedule-overlay button:disabled{opacity:.5;cursor:default}.adeo-schedule-overlay :focus-visible{outline:3px solid #efb73d;outline-offset:2px}
+            .adeo-schedule-field{display:flex;flex-direction:column;gap:4px;margin:9px 0;min-width:0}.adeo-schedule-field input,.adeo-schedule-field select{background:white;border:1px solid #bdcadd;border-radius:5px;padding:7px 8px;min-width:0;width:100%;color:#223047}
+            .adeo-schedule-check{display:inline-flex;align-items:center;gap:7px;margin:6px 16px 6px 0}.adeo-schedule-check input{width:17px;height:17px}.adeo-schedule-weekdays{display:flex;flex-wrap:wrap;gap:3px}
+            .adeo-schedule-box{padding:16px;background:white;border:1px solid #dce3ee;border-radius:8px;margin:12px 0}.adeo-schedule-box h3{font-size:16px;line-height:1.4;margin:0 0 10px;color:#223047}
+            .adeo-schedule-note{color:#53647c;margin:8px 0}.adeo-schedule-error{color:#a92323;white-space:pre-line;margin:8px 0}.adeo-schedule-error:empty{display:none}.adeo-schedule-success{color:#176238}
+            .adeo-schedule-grid{display:grid;grid-template-columns:repeat(7,minmax(205px,1fr));gap:10px;align-items:start;overflow-x:auto;padding-bottom:12px}
+            .adeo-schedule-day{background:white;border:1px solid #dce3ee;border-radius:8px;overflow:hidden}.adeo-schedule-day header{background:#e8eff9;padding:12px;font-weight:bold}.adeo-schedule-day header small{display:block;font-weight:normal;margin-top:3px}.adeo-schedule-day-body{padding:10px}
+            .adeo-schedule-row{border:1px solid #dce3ee;border-radius:6px;padding:10px;margin:10px 0;background:white}.adeo-schedule-row-tools{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}.adeo-schedule-row-tools button{padding:4px 8px}
+            details.adeo-schedule-row>summary{cursor:pointer;white-space:pre-line;font-size:13px;line-height:1.6}details.adeo-schedule-row[open]>summary{padding-bottom:8px;border-bottom:1px solid #dce3ee}.adeo-schedule-row-invalid{border-color:#c64343}.adeo-schedule-row-invalid>summary{color:#a92323}
+            .adeo-schedule-template{max-width:980px;display:grid;grid-template-columns:repeat(auto-fit,minmax(225px,1fr));gap:12px}.adeo-schedule-template .adeo-schedule-row{margin:0}
+            .adeo-schedule-mode{display:flex;gap:16px;flex-wrap:wrap}.adeo-schedule-mode button{flex:1;min-width:240px;text-align:left;padding:22px;font-size:18px}.adeo-schedule-mode small{display:block;font-size:14px;margin-top:9px}
+            .adeo-schedule-flex{display:flex;align-items:end;gap:12px;flex-wrap:wrap}.adeo-schedule-flex>.adeo-schedule-field{min-width:180px}.adeo-schedule-conflict{display:grid;grid-template-columns:minmax(150px,1fr) minmax(180px,2fr) minmax(150px,1fr);gap:14px;border-bottom:1px solid #dce3ee;padding:14px 0}
+            .adeo-schedule-progress{width:100%;height:18px}.adeo-schedule-step{font-size:13px;color:#dbeaff}.adeo-schedule-summary{font-weight:600;margin:12px 0}
+            @media(max-width:650px){.adeo-schedule-overlay{padding:5px}.adeo-schedule-modal{max-height:98vh;width:100%}.adeo-schedule-content{padding:12px}.adeo-schedule-header{padding:12px}.adeo-schedule-conflict{grid-template-columns:1fr}.adeo-schedule-footer{padding:10px}.adeo-schedule-grid{grid-template-columns:repeat(7,minmax(225px,1fr))}}
+        `;
+        document.head.append(style);
+    }
+
+    function scheduleElement(tag, text, className) {
+        const element = document.createElement(tag);
+        if (text !== undefined && text !== null) element.textContent = text;
+        if (className) element.className = className;
+        return element;
+    }
+
+    async function openScheduleWizard(calendar, launcher) {
+        if (document.querySelector('.adeo-schedule-overlay')) return;
+        const proxy = findScheduleProxy(calendar);
+        if (!proxy?.supplier?.id) { alert('Не удалось определить выбранного поставщика. Обновите CRM и снова откройте календарь.'); return; }
+        let adapter;
+        try { adapter = createScheduleAdapter(proxy); } catch (error) { alert(error.message); return; }
+        installScheduleStyles();
+        const supplierId = proxy.supplier.id;
+        const state = {
+            phase: 'loading', mode: '', startDate: addScheduleDays(scheduleDay(), 1), sourceDate: addScheduleDays(scheduleDay(), 1),
+            targetDate: addScheduleDays(scheduleDay(), 2), nfile: null, storages: [], orderDays: [0, 1, 2, 3, 4], deliveryDays: [0, 1, 2, 3, 4],
+            template: [{ uid: String(++scheduleDraftSequence), sendTime: '09:00', leadDays: 1, deliveryHour: 15, haveDelivery: true }],
+            groups: [], events: [], decisions: {}, snapshot: '', dirty: false, busy: false, error: '', job: null
+        };
+        const overlay = scheduleElement('div', null, 'adeo-schedule-overlay');
+        const modal = scheduleElement('section', null, 'adeo-schedule-modal');
+        modal.setAttribute('role', 'dialog'); modal.setAttribute('aria-modal', 'true'); modal.setAttribute('aria-labelledby', 'adeo-schedule-title');
+        modal.tabIndex = -1;
+        const header = scheduleElement('div', null, 'adeo-schedule-header');
+        const heading = scheduleElement('h2', `Расписание — ${proxy.supplier.cella || supplierId}`); heading.id = 'adeo-schedule-title';
+        const closeButton = scheduleElement('button', '×', 'adeo-schedule-close'); closeButton.type = 'button'; closeButton.setAttribute('aria-label', 'Закрыть мастер');
+        header.append(heading, closeButton);
+        const content = scheduleElement('div', null, 'adeo-schedule-content');
+        const footer = scheduleElement('div', null, 'adeo-schedule-footer');
+        const errorBox = scheduleElement('div', '', 'adeo-schedule-error'); errorBox.setAttribute('role', 'alert');
+        modal.append(header, content, footer); overlay.append(modal);
+        const host = calendar.closest('.q-dialog__inner') || document.body;
+        const previousOverflow = document.body.style.overflow;
+        document.body.style.overflow = 'hidden'; host.append(overlay); modal.focus();
+
+        const assertContext = () => {
+            if (!calendar.isConnected || String(proxy.supplier?.id) !== String(supplierId) || !/^\/supplier\/supplier-list\/?$/.test(window.location.pathname)) {
+                throw new Error('Выбранный поставщик или страница изменились. Закройте мастер и откройте его заново.');
+            }
+        };
+        function close() {
+            if (state.busy) return;
+            if (state.phase !== 'done' && state.dirty && !window.confirm('Закрыть мастер? Несохранённый черновик будет потерян. Уже выполненные операции в CRM сохранятся.')) return;
+            overlay.remove(); document.body.style.overflow = previousOverflow;
+            document.removeEventListener('keydown', onKey, true);
+            if (launcher.isConnected) launcher.focus();
+        }
+        function onKey(event) {
+            if (!overlay.isConnected) return;
+            if (event.key === 'Escape') { event.preventDefault(); event.stopImmediatePropagation(); close(); }
+            if (event.key === 'Tab') {
+                const focusable = [...modal.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),[tabindex="0"]')].filter(node => node.getClientRects().length);
+                if (!focusable.length) { event.preventDefault(); modal.focus(); return; }
+                const first = focusable[0], last = focusable[focusable.length - 1];
+                if (event.shiftKey && (document.activeElement === first || document.activeElement === modal)) { event.preventDefault(); last.focus(); }
+                else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+            }
+        }
+        closeButton.addEventListener('click', close); document.addEventListener('keydown', onKey, true);
+
+        function showError(error) { state.error = error?.message || String(error); errorBox.textContent = state.error; errorBox.scrollIntoView({ block: 'nearest' }); }
+        function clearError() { state.error = ''; errorBox.textContent = ''; }
+        function setBusy(value) {
+            state.busy = value; closeButton.disabled = value;
+            modal.setAttribute('aria-busy', String(value));
+            for (const input of content.querySelectorAll('input,select')) {
+                if (value) { input.dataset.schedulePreviousDisabled = String(input.disabled); input.disabled = true; }
+                else if ('schedulePreviousDisabled' in input.dataset) {
+                    input.disabled = input.dataset.schedulePreviousDisabled === 'true'; delete input.dataset.schedulePreviousDisabled;
+                }
+            }
+        }
+        function button(parent, label, action, kind = '') {
+            const node = scheduleElement('button', label, `adeo-schedule-button ${kind}`); node.type = 'button';
+            node.addEventListener('click', async () => {
+                if (state.busy) return;
+                clearError();
+                try { await action(); } catch (error) { showError(error); }
+            });
+            parent.append(node); return node;
+        }
+        function note(parent, text) { parent.append(scheduleElement('p', text, 'adeo-schedule-note')); }
+        function field(parent, label, type, value, change, options = {}) {
+            const wrapper = scheduleElement('label', null, 'adeo-schedule-field'); wrapper.append(scheduleElement('span', label));
+            const input = scheduleElement('input'); input.type = type; input.value = value ?? '';
+            input.setAttribute('aria-label', label);
+            for (const [key, item] of Object.entries(options)) input.setAttribute(key, item);
+            input.addEventListener('change', () => {
+                if (state.busy) return;
+                state.dirty = true;
+                try { change(input.value); } catch (error) { showError(error); }
+            });
+            wrapper.append(input); parent.append(wrapper); return input;
+        }
+        function select(parent, label, value, choices, change) {
+            const wrapper = scheduleElement('label', null, 'adeo-schedule-field'); wrapper.append(scheduleElement('span', label));
+            const input = scheduleElement('select');
+            input.setAttribute('aria-label', label);
+            for (const choice of choices) { const option = scheduleElement('option', choice.label); option.value = choice.value; input.append(option); }
+            input.value = value ?? '';
+            input.addEventListener('change', () => {
+                if (state.busy) return;
+                state.dirty = true;
+                try { change(input.value); } catch (error) { showError(error); }
+            });
+            wrapper.append(input); parent.append(wrapper); return input;
+        }
+        function check(parent, label, checked, change, disabled = false) {
+            const wrapper = scheduleElement('label', null, 'adeo-schedule-check'); const input = scheduleElement('input'); input.type = 'checkbox'; input.checked = checked; input.disabled = disabled;
+            input.addEventListener('change', () => {
+                if (state.busy) return;
+                state.dirty = true;
+                try { change(input.checked); } catch (error) { showError(error); }
+            }); wrapper.append(input, scheduleElement('span', label)); parent.append(wrapper); return input;
+        }
+        function weekdays(parent, label, property, delivery = false) {
+            const box = scheduleElement('div', null, 'adeo-schedule-box'); box.append(scheduleElement('h3', label));
+            const choices = scheduleElement('div', null, 'adeo-schedule-weekdays');
+            SCHEDULE_WEEKDAYS.forEach((name, day) => check(choices, name, state[property].includes(day), checked => {
+                state[property] = checked ? [...state[property], day].sort() : state[property].filter(value => value !== day);
+                if (state.phase === 'review') updateReviewErrors();
+            }, delivery && day === 6));
+            box.append(choices); if (delivery) note(box, 'Дни приезда на ваш склад. Воскресенье закрыто, в субботу приёмка до 16:00.'); parent.append(box);
+        }
+        function freshTemplate() { return { uid: String(++scheduleDraftSequence), sendTime: '09:00', leadDays: 1, deliveryHour: 15, haveDelivery: true }; }
+        function allDrafts() { return state.groups.filter(group => group.enabled).flatMap(group => group.entries); }
+        function reviewErrors() {
+            const errors = [];
+            for (const group of state.groups.filter(item => item.enabled)) {
+                const slots = new Set();
+                for (const row of group.entries) {
+                    errors.push(...validateScheduleDraft(row, state.deliveryDays).map(text => `${group.date}, ${row.sendTime || 'время не указано'}: ${text}`));
+                    const slot = JSON.stringify([scheduleNfile(row.nfile), row.sendTime]);
+                    if (slots.has(slot)) errors.push(`${group.date}: повторная отправка одного склада в ${row.sendTime}.`);
+                    slots.add(slot);
+                }
+            }
+            return errors;
+        }
+        function updateReviewErrors() {
+            for (const row of allDrafts()) {
+                const box = content.querySelector(`[data-schedule-error="${row.uid}"]`);
+                const errors = validateScheduleDraft(row, state.deliveryDays);
+                if (box) box.textContent = errors.join(' ');
+                const summary = content.querySelector(`[data-schedule-row-summary="${row.uid}"]`);
+                if (summary) {
+                    const warehouse = state.mode === 'copy' ? ` · склад ${scheduleNfile(row.nfile) || 'все'}` : '';
+                    summary.textContent = `${row.sendTime || 'Укажите время'}${warehouse}\n${row.haveDelivery ? `${row.deliveryDate || 'Укажите дату'} ${scheduleHourLabel(row.deliveryHour)}` : 'Без доставки'}${errors.length ? '\n⚠ Требует исправления' : ''}`;
+                    summary.parentElement.classList.toggle('adeo-schedule-row-invalid', errors.length > 0);
+                }
+            }
+            const summary = content.querySelector('[data-schedule-summary]');
+            if (summary) summary.textContent = `Записей: ${allDrafts().length}. Дней для изменения: ${state.groups.filter(group => group.enabled).length}. Замечаний: ${reviewErrors().length}.`;
+            const fixes = content.querySelector('[data-schedule-saturday-fix]');
+            if (fixes) { fixes.replaceChildren(); renderSaturdayFix(fixes); }
+        }
+        function renderRow(parent, row, entries, template = false) {
+            const box = scheduleElement(template ? 'div' : 'details', null, 'adeo-schedule-row');
+            if (!template) {
+                const summary = scheduleElement('summary'); summary.dataset.scheduleRowSummary = row.uid; box.append(summary);
+                box.open = Boolean(row.expanded); box.addEventListener('toggle', () => { row.expanded = box.open; });
+            }
+            if (!template && state.mode === 'copy') note(box, `Склад: ${scheduleNfile(row.nfile) || 'все (общая запись)'}`);
+            const update = () => { if (!template) updateReviewErrors(); };
+            field(box, 'Отправка заказа', 'time', row.sendTime, value => { row.sendTime = value; update(); }, { step: '60', required: '' });
+            const deliveryControls = scheduleElement('div');
+            check(box, 'Указать доставку', row.haveDelivery, value => {
+                row.haveDelivery = value;
+                if (!template && value && !row.deliveryDate) row.deliveryDate = nextScheduleDelivery(row.sendDate, state.deliveryDays);
+                render();
+            });
+            if (row.haveDelivery) {
+                if (template) field(deliveryControls, 'Через календарных дней', 'number', row.leadDays, value => { row.leadDays = value === '' ? NaN : Number(value); }, { min: '0', step: '1', required: '' });
+                else field(deliveryControls, 'Дата доставки', 'date', row.deliveryDate, value => { row.deliveryDate = value; update(); }, { min: row.sendDate, required: '' });
+                select(deliveryControls, 'Интервал доставки', row.deliveryHour, Array.from({ length: 24 }, (_, hour) => ({ value: String(hour), label: scheduleHourLabel(hour) })), value => { row.deliveryHour = Number(value); update(); });
+                if (!template) button(deliveryControls, 'Ближайший день доставки', () => {
+                    let from = row.deliveryDate && row.deliveryDate >= row.sendDate ? row.deliveryDate : row.sendDate;
+                    if (from === row.sendDate && `${schedulePad(row.deliveryHour)}:00` < row.sendTime) from = addScheduleDays(from, 1);
+                    row.deliveryDate = nextScheduleDelivery(from, state.deliveryDays); state.dirty = true; render();
+                });
+            }
+            box.append(deliveryControls);
+            if (!template) { const errors = scheduleElement('div', '', 'adeo-schedule-error'); errors.dataset.scheduleError = row.uid; box.append(errors); }
+            const tools = scheduleElement('div', null, 'adeo-schedule-row-tools');
+            button(tools, 'Копия', () => { entries.splice(entries.indexOf(row) + 1, 0, { ...row, uid: String(++scheduleDraftSequence), expanded: true }); state.dirty = true; render(); });
+            button(tools, 'Удалить', () => { entries.splice(entries.indexOf(row), 1); state.dirty = true; render(); }, 'danger');
+            box.append(tools); parent.append(box);
+        }
+        function renderSetup() {
+            if (state.mode === 'new') {
+                const box = scheduleElement('div', null, 'adeo-schedule-box'); box.append(scheduleElement('h3', '1. Склад и дата начала'));
+                select(box, 'Номер склада', scheduleNfile(state.nfile), [{ value: '', label: 'Все склады — общее правило' }, ...state.storages.map(storage => ({
+                    value: String(storage.nfile), label: `${storage.nfile}${storage.name ? ` — ${storage.name}` : ''}`
+                }))], value => { state.nfile = value === '' ? null : state.storages.find(storage => String(storage.nfile) === value)?.nfile ?? value; });
+                note(box, 'Общее правило хранится с пустым номером склада. Отдельные правила конкретных складов при его замене сохраняются.');
+                field(box, 'Начать с', 'date', state.startDate, value => { state.startDate = value; }, { min: addScheduleDays(scheduleDay(), 1) }); content.append(box);
+                weekdays(content, '2. Когда отправлять заказы поставщику', 'orderDays');
+                weekdays(content, '3. Когда поставщик может привезти товар', 'deliveryDays', true);
+                button(footer, 'Далее: заполнить день', () => {
+                    parseScheduleDay(state.startDate);
+                    if (state.startDate <= scheduleDay()) throw new Error('Выберите дату начала не раньше завтра.');
+                    if (!state.orderDays.length) throw new Error('Выберите хотя бы один день отправки.');
+                    nextScheduleDelivery(state.startDate, state.deliveryDays); state.phase = 'template'; render();
+                }, 'primary');
+            } else {
+                const box = scheduleElement('div', null, 'adeo-schedule-box'); box.append(scheduleElement('h3', 'Копирование еженедельных записей'));
+                field(box, 'Из какого дня', 'date', state.sourceDate, value => { state.sourceDate = value; });
+                field(box, 'В какой день', 'date', state.targetDate, value => { state.targetDate = value; }, { min: addScheduleDays(scheduleDay(), 1) });
+                note(box, 'Копируются только еженедельные записи загруженного дня, со всеми исходными складами. Все даты сдвигаются на одинаковое число дней.'); content.append(box);
+                weekdays(content, 'Допустимые дни доставки для проверки копии', 'deliveryDays', true);
+                button(footer, 'Подготовить копию', async () => {
+                    parseScheduleDay(state.sourceDate); parseScheduleDay(state.targetDate);
+                    if (state.sourceDate === state.targetDate) throw new Error('Выберите другой день назначения.');
+                    if (state.targetDate <= scheduleDay()) throw new Error('День назначения должен быть будущим.');
+                    nextScheduleDelivery(state.targetDate, state.deliveryDays);
+                    assertContext(); setBusy(true);
+                    try {
+                        const events = await adapter.list(supplierId);
+                        const source = events.filter(event => isWeeklySchedule(event) && scheduleDay(event.ordersAcceptedAt) === state.sourceDate);
+                        if (!source.length) throw new Error('CRM не вернула еженедельных записей для этого дня. Выберите день с загруженным расписанием.');
+                        const offset = (parseScheduleDay(state.targetDate) - parseScheduleDay(state.sourceDate)) / 86400000;
+                        const entries = source.map(event => scheduleEventToDraft(event, offset));
+                        state.events = events; state.groups = [{ date: state.targetDate, weekday: scheduleWeekday(state.targetDate), enabled: true,
+                            nfiles: [...new Map(entries.map(row => [scheduleNfile(row.nfile), row.nfile])).values()], entries }];
+                        state.dirty = true; state.phase = 'review';
+                    } finally { setBusy(false); render(); }
+                }, 'primary');
+            }
+        }
+
+        function renderSaturdayFix(parent) {
+            const rows = allDrafts().filter(row => {
+                try { return row.haveDelivery && row.deliveryDate && scheduleWeekday(row.deliveryDate) === 5 && row.deliveryHour > 15; }
+                catch { return false; }
+            });
+            if (!rows.length) return;
+            const box = scheduleElement('div', null, 'adeo-schedule-box'); box.append(scheduleElement('h3', `Суббота: исправить время у ${rows.length} доставок`));
+            const selected = new Set(rows.map(row => row.uid));
+            rows.forEach(row => check(box, `${row.sendDate} ${row.sendTime} → ${row.deliveryDate}, ${scheduleHourLabel(row.deliveryHour)}${scheduleNfile(row.nfile) ? `, склад ${row.nfile}` : ''}`, true,
+                checked => checked ? selected.add(row.uid) : selected.delete(row.uid)));
+            let hour = '';
+            select(box, 'Общий интервал для выбранных записей', '', [{ value: '', label: 'Выберите интервал' }, ...Array.from({ length: 16 }, (_, value) => ({ value: String(value), label: scheduleHourLabel(value) }))], value => { hour = value; });
+            button(box, 'Применить к выбранным', () => {
+                if (hour === '') throw new Error('Выберите субботний интервал.');
+                rows.filter(row => selected.has(row.uid)).forEach(row => { row.deliveryHour = Number(hour); }); state.dirty = true; render();
+            }); parent.append(box);
+        }
+
+        function renderReview() {
+            note(content, 'Предпросмотр еженедельного расписания. У каждого дня указана первая будущая дата; записи появятся начиная с неё. Все правки пока остаются в мастере.');
+            if (state.mode === 'copy') weekdays(content, 'Разрешённые дни доставки', 'deliveryDays', true);
+            const summary = scheduleElement('p', '', 'adeo-schedule-summary'); summary.dataset.scheduleSummary = ''; content.append(summary);
+            const fixes = scheduleElement('div'); fixes.dataset.scheduleSaturdayFix = ''; content.append(fixes);
+            const grid = scheduleElement('div', null, 'adeo-schedule-grid'); if (state.mode === 'copy') grid.style.gridTemplateColumns = 'minmax(260px,600px)';
+            for (const group of state.groups) {
+                const day = scheduleElement('section', null, 'adeo-schedule-day'); const dayHeader = scheduleElement('header', SCHEDULE_WEEKDAYS[group.weekday]);
+                dayHeader.append(scheduleElement('small', group.date)); const body = scheduleElement('div', null, 'adeo-schedule-day-body');
+                if (state.mode === 'new') check(body, 'Изменять этот день', group.enabled, checked => { group.enabled = checked; state.dirty = true; render(); });
+                if (group.enabled) {
+                    button(body, '＋ Добавить запись', () => {
+                        group.entries.push({ uid: String(++scheduleDraftSequence), nfile: state.mode === 'new' ? state.nfile : group.nfiles[0],
+                            sendDate: group.date, sendTime: '09:00', haveDelivery: true, deliveryDate: nextScheduleDelivery(addScheduleDays(group.date, 1), state.deliveryDays), deliveryHour: 15, expanded: true }); state.dirty = true; render();
+                    });
+                    if (state.mode === 'new') {
+                        const nextDay = state.groups.find(item => item.date === addScheduleDays(group.date, 1));
+                        if (nextDay) button(body, 'На следующий день', () => requestDraftCopy(group, nextDay));
+                        let target = '';
+                        select(body, 'Скопировать весь день в', '', [{ value: '', label: 'Выберите день' }, ...state.groups.filter(item => item !== group).map(item => ({ value: item.date, label: `${SCHEDULE_WEEKDAYS[item.weekday]} ${item.date}` }))], value => { target = value; });
+                        button(body, 'Копировать день', () => {
+                            const destination = state.groups.find(item => item.date === target);
+                            if (!destination) throw new Error('Выберите день назначения.');
+                            requestDraftCopy(group, destination);
+                        });
+                    }
+                    if (!group.entries.length) note(body, 'Нет отправок. При замене существующее расписание этого дня будет очищено.');
+                    group.entries.forEach(row => renderRow(body, row, group.entries));
+                }
+                day.append(dayHeader, body); grid.append(day);
+            }
+            content.append(grid); updateReviewErrors();
+            button(footer, 'Назад', () => { state.phase = state.mode === 'new' ? 'template' : 'setup'; render(); });
+            button(footer, 'Сохранить всё', prepareSave, 'primary');
+        }
+
+        function requestDraftCopy(source, destination) {
+            if (destination.entries.length) { renderDraftCopyChoice(source, destination); return; }
+            destination.entries = copyScheduleDrafts(source.entries, source.date, destination.date);
+            destination.enabled = true; state.dirty = true; render();
+        }
+
+        function renderDraftCopyChoice(source, destination) {
+            content.replaceChildren(); footer.replaceChildren(); content.append(errorBox);
+            content.append(scheduleElement('h3', `День ${destination.date} уже заполнен в черновике`));
+            note(content, 'Выберите, как скопировать записи. В CRM ничего не изменится до общего сохранения.');
+            const copy = replace => {
+                const copied = copyScheduleDrafts(source.entries, source.date, destination.date);
+                destination.entries = replace ? copied : [...destination.entries, ...copied]; destination.enabled = true; state.dirty = true; render();
+            };
+            button(footer, 'Отмена', render); button(footer, 'Добавить', () => copy(false)); button(footer, 'Заменить', () => copy(true), 'primary');
+        }
+
+        async function prepareSave() {
+            const errors = reviewErrors(); if (errors.length) throw new Error(errors.slice(0, 8).join('\n'));
+            if (!state.groups.some(group => group.enabled)) throw new Error('Выберите хотя бы один день для изменения.');
+            assertContext(); setBusy(true);
+            try {
+                state.events = await adapter.list(supplierId); state.snapshot = scheduleFingerprint(state.events); state.decisions = {};
+                state.phase = 'confirm';
+            } finally { setBusy(false); render(); }
+        }
+
+        function describeEvent(event) {
+            const delivery = event.orderDeliveryIntervalStart ? `${scheduleDay(event.orderDeliveryIntervalStart)} ${scheduleTime(event.orderDeliveryIntervalStart)}–${scheduleTime(event.orderDeliveryIntervalEnd)}` : 'без доставки';
+            return `${scheduleTime(event.ordersAcceptedAt)}, склад ${scheduleNfile(event.nfile) || 'все (общее правило)'} → ${delivery}`;
+        }
+
+        function renderConfirm() {
+            const conflicts = findScheduleConflicts(state.events, state.groups).filter(item => item.count);
+            content.append(scheduleElement('h3', 'Проверка перед сохранением'));
+            note(content, 'Новые записи будут повторяться еженедельно. «Заменить» прекращает прежние повторы с указанной будущей даты и удаляет разовые записи этой даты в выбранных складах. Прошедшие даты и другие склады сохраняются.');
+            if (!conflicts.length) note(content, 'Существующих записей в выбранных днях и складах не найдено. Можно сохранить подготовленное расписание.');
+            else {
+                const bulk = scheduleElement('div', null, 'adeo-schedule-flex');
+                for (const [value, label] of [['add', 'Везде добавить'], ['replace', 'Везде заменить'], ['skip', 'Везде пропустить']]) {
+                    button(bulk, label, () => { conflicts.forEach(item => { state.decisions[item.group.date] = value; }); render(); });
+                }
+                content.append(bulk);
+                for (const conflict of conflicts) {
+                    const box = scheduleElement('div', null, 'adeo-schedule-conflict');
+                    box.append(scheduleElement('strong', `${SCHEDULE_WEEKDAYS[scheduleWeekday(conflict.group.date)]}, с ${conflict.group.date}`));
+                    const details = scheduleElement('div');
+                    note(details, `Существующих правил: ${conflict.count}. Новых записей: ${conflict.group.entries.length}.`);
+                    for (const series of conflict.weekly) note(details, `Еженедельно: ${describeEvent(series.first || series.instances[0])}${series.first ? '' : ' — будущий экземпляр пока не загружен, замена недоступна'}`);
+                    for (const event of conflict.once) note(details, `Разовая: ${describeEvent(event)}`);
+                    box.append(details);
+                    select(box, 'Действие', state.decisions[conflict.group.date] || '', [
+                        { value: '', label: 'Выберите действие' }, { value: 'add', label: 'Добавить' }, { value: 'replace', label: 'Заменить' }, { value: 'skip', label: 'Пропустить день' }
+                    ], value => { state.decisions[conflict.group.date] = value; }); content.append(box);
+                }
+            }
+            button(footer, 'Отмена — к черновику', () => { state.phase = 'review'; render(); });
+            button(footer, 'Подтвердить сохранение', commitSave, 'primary');
+        }
+
+        async function commitSave() {
+            assertContext();
+            const job = makeSchedulePlan(state.events, state.groups, state.decisions, supplierId, state.deliveryDays);
+            setBusy(true);
+            try {
+                const latest = await adapter.list(supplierId);
+                if (scheduleFingerprint(latest) !== state.snapshot) {
+                    state.events = latest; state.snapshot = scheduleFingerprint(latest); state.decisions = {}; render();
+                    throw new Error('За время проверки расписание в CRM изменилось. Проверьте обновлённые конфликты и снова выберите действия.');
+                }
+                state.job = job; state.phase = 'saving'; render();
+                await executeJob();
+            } finally { setBusy(false); render(); }
+        }
+
+        async function executeJob() {
+            try {
+                await runSchedulePlan(state.job, adapter, assertContext, renderProgress);
+                state.phase = 'done'; state.dirty = false;
+                try { await proxy.loadSchedules(); } catch { state.error = 'Записи сохранены, но календарь не обновился. Нажмите штатную кнопку обновления календаря.'; }
+            } catch (error) { state.phase = 'failed'; state.error = error?.message || 'Не удалось завершить сохранение.'; }
+        }
+
+        function renderProgress() {
+            const label = content.querySelector('[data-schedule-progress-label]');
+            if (label) label.textContent = `Выполнено ${state.job.index} из ${state.job.operations.length}. Создано: ${state.job.created}, удалено: ${state.job.deleted}.`;
+            const progress = content.querySelector('progress'); if (progress) progress.value = state.job.index;
+        }
+
+        function renderJob() {
+            const job = state.job;
+            content.append(scheduleElement('h3', state.phase === 'done' ? 'Расписание сохранено' : state.phase === 'failed' ? 'Сохранение остановлено' : 'Сохранение расписания'));
+            const label = scheduleElement('p'); label.dataset.scheduleProgressLabel = ''; label.setAttribute('role', 'status'); label.setAttribute('aria-live', 'polite'); content.append(label);
+            const progress = scheduleElement('progress', null, 'adeo-schedule-progress'); progress.max = job.operations.length || 1; progress.value = job.index; content.append(progress); renderProgress();
+            if (job.skipped) note(content, `Одинаковых еженедельных правил уже было в CRM: ${job.skipped}. Повторно они не создавались.`);
+            if (state.phase === 'done') button(footer, 'Закрыть', close, 'primary');
+            if (state.phase === 'failed') {
+                note(content, 'Уже выполненные изменения сохранены в CRM. Повторная отправка неподтверждённого запроса автоматически не выполняется, чтобы не создавать дубли.');
+                button(footer, 'Проверить результат и продолжить', async () => {
+                    assertContext(); setBusy(true);
+                    try {
+                        if (!await reconcileSchedulePlan(job, adapter, supplierId)) throw new Error('CRM пока не подтверждает результат последней операции. Продолжение заблокировано. Обновите календарь и сверьте расписание; не запускайте тот же черновик повторно без проверки.');
+                        state.phase = 'saving'; render(); await executeJob();
+                    } finally { setBusy(false); render(); }
+                }, 'primary');
+            }
+        }
+
+        function render() {
+            content.replaceChildren(); footer.replaceChildren(); errorBox.textContent = state.error; content.append(errorBox);
+            if (state.phase === 'loading') { note(content, 'Загружаем расписание и склады выбранного поставщика…'); return; }
+            if (state.phase === 'load-error') { note(content, 'Не удалось загрузить данные CRM. Закройте мастер и попробуйте снова.'); return; }
+            if (state.phase === 'choose') {
+                note(content, 'Выберите действие для текущего поставщика.'); const modes = scheduleElement('div', null, 'adeo-schedule-mode');
+                for (const [mode, title, description] of [['copy', 'Скопировать день', 'Перенести все еженедельные записи конкретного дня на другую дату.'], ['new', 'Заполнить с нуля', 'Выбрать дни, заполнить один день и подготовить всю неделю.']]) {
+                    const node = button(modes, title, () => { state.mode = mode; state.phase = 'setup'; render(); }, 'primary'); node.append(scheduleElement('small', description));
+                }
+                content.append(modes); return;
+            }
+            if (state.phase === 'setup') { button(footer, 'Назад', () => { state.phase = 'choose'; render(); }); renderSetup(); }
+            else if (state.phase === 'template') {
+                content.append(scheduleElement('h3', 'Заполните один день отправок'));
+                note(content, 'Добавьте любое количество записей. Срок считается в календарных днях, затем доставка переносится на ближайший разрешённый день. Время для короткой субботы проверим отдельно.');
+                const rows = scheduleElement('div', null, 'adeo-schedule-template'); state.template.forEach(row => renderRow(rows, row, state.template, true)); content.append(rows);
+                button(content, '＋ Добавить запись', () => { state.template.push(freshTemplate()); state.dirty = true; render(); });
+                button(footer, 'Назад', () => { state.phase = 'setup'; render(); });
+                button(footer, 'Заполнить выбранные дни', () => {
+                    if (state.groups.length && !window.confirm('Сформировать неделю заново? Индивидуальные правки дней будут заменены шаблоном.')) return;
+                    state.groups = buildScheduleWeek(state.template, state.orderDays, state.deliveryDays, state.startDate, state.nfile);
+                    state.dirty = true; state.phase = 'review'; render();
+                }, 'primary');
+            } else if (state.phase === 'review') renderReview();
+            else if (state.phase === 'confirm') renderConfirm();
+            else renderJob();
+        }
+        render();
+        try {
+            assertContext();
+            state.events = await adapter.list(supplierId);
+            state.storages = Array.isArray(proxy.storages) ? [...proxy.storages] : [];
+            if (!state.storages.length && typeof proxy.$svcPlatformV1Client === 'function') {
+                const response = await proxy.$svcPlatformV1Client({ url: '/b2b/supplier/storage/search', method: 'POST', data: { isDisabled: false, supplierId } });
+                if (!Array.isArray(response?.data?.content)) throw new Error('CRM вернула неизвестный список складов.');
+                state.storages = response.data.content;
+            }
+            state.storages = state.storages.filter(storage => storage.nfile !== null && storage.nfile !== undefined);
+            state.phase = 'choose';
+        } catch (error) { state.phase = 'load-error'; state.error = error.message; }
+        if (overlay.isConnected) render();
+    }
+
+    function initSupplierCalendar() {
+        function update() {
+            if (!/^\/supplier\/supplier-list\/?$/.test(window.location.pathname)) return;
+            document.querySelectorAll('.work-calendar').forEach(calendar => {
+                if (calendar.querySelector('.adeo-schedule-launch')) return;
+                const toolbar = calendar.querySelector('.row'); if (!toolbar) return;
+                const button = scheduleElement('button', 'Мастер расписания', 'adeo-schedule-launch'); button.type = 'button';
+                button.addEventListener('click', () => openScheduleWizard(calendar, button).catch(error => alert(error.message)));
+                toolbar.append(button);
+            });
+        }
+        const observer = new MutationObserver(mutations => {
+            if (mutations.every(mutation => {
+                const element = mutation.target.nodeType === 3 ? mutation.target.parentElement : mutation.target;
+                return element?.closest?.('.adeo-schedule-overlay');
+            })) return;
+            update();
+        });
+        observer.observe(document.body, { childList: true, subtree: true }); update();
+        window.addEventListener('pagehide', () => observer.disconnect());
+        window.addEventListener('pageshow', event => { if (event.persisted) { observer.observe(document.body, { childList: true, subtree: true }); update(); } });
+    }
+
     function init() {
         const path = window.location.pathname;
         if (/^\/admin\/admin_pricerelevance\/list\/?$/.test(path)) initPriceRelevance();
         else if (path.startsWith('/admin/supplier/price/compare/')) initCompare();
         else if (path.startsWith('/admin/supplier/price/comparemode/')) initCompareMode();
+        else if (window.location.hostname === 'crm.adeo.pro') initSupplierCalendar();
     }
 
     installLoadingProgress();
