@@ -20,6 +20,8 @@ function setup(document = {}) {
 const api = setup();
 const plain = value => JSON.parse(JSON.stringify(value));
 const weekdays = [0, 1, 2, 3, 4, 5];
+// Урезанный ответ CRM: десять прежних правил и шесть правил с будущими экземплярами.
+const crmHistory = JSON.parse(readFileSync(resolve(__dirname, 'fixtures/crm-schedule-history.json'), 'utf8'));
 const tomorrow = () => api.addScheduleDays(api.scheduleDay(), 1);
 function row(date = '2026-10-27', changes = {}) {
     return { uid: '1', nfile: 7, sendDate: date, sendTime: '09:00', haveDelivery: true,
@@ -117,7 +119,7 @@ test('Все склады обнаруживает и заменяет общи�
 test('Все склады обнаруживает конфликт даже при отсутствии записей с пустым складом', () => {
     const events = [event(1, '2026-10-27'), event(2, '2026-10-27', { nfile: 8 })];
     const groups = [group('2026-10-27', [row('2026-10-27', { nfile: null })], [null])];
-    assert.equal(api.findScheduleConflicts(events, groups)[0].count, 2);
+    assert.equal(api.findScheduleConflicts(events, groups, '2026-10-26')[0].count, 2);
     assert.throws(() => api.makeSchedulePlan(events, groups, {}, 127, weekdays, '2026-10-26'), /Выберите действие/);
     assert.throws(() => api.makeSchedulePlan(events, groups, { '2026-10-27': 'add' }, 127, weekdays, '2026-10-26'), /уже существует/);
 });
@@ -125,7 +127,7 @@ test('Все склады обнаруживает конфликт даже п�
 test('Замена одного склада не удаляет общее правило остальных складов', () => {
     const events = [event(1, '2026-10-27', { nfile: null })];
     const groups = [group('2026-10-27', [row()])];
-    assert.equal(api.findScheduleConflicts(events, groups)[0].count, 1);
+    assert.equal(api.findScheduleConflicts(events, groups, '2026-10-26')[0].count, 1);
     assert.throws(() => api.makeSchedulePlan(events, groups, { '2026-10-27': 'replace' }, 127, weekdays, '2026-10-26'), /нельзя удалить/);
     assert.throws(() => api.makeSchedulePlan(events, groups, { '2026-10-27': 'add' }, 127, weekdays, '2026-10-26'), /уже существует/);
 });
@@ -161,13 +163,48 @@ test('Пустой день можно очистить, пропуск не с�
 });
 
 test('Замена за пределами загруженных будущих экземпляров блокируется', () => {
-    assert.throws(() => api.makeSchedulePlan([event(1, '2026-10-20')], [group('2026-12-01', [row('2026-12-01')])],
+    assert.throws(() => api.makeSchedulePlan([event(1, '2026-10-27')], [group('2026-12-01', [row('2026-12-01')])],
         { '2026-12-01': 'replace' }, 127, weekdays, '2026-10-26'), /будущий экземпляр/);
 });
 
-test('Историческая запись без будущих экземпляров не считается подтверждением действующего повтора', () => {
-    assert.throws(() => api.makeSchedulePlan([event(1, '2026-10-20')], [group('2026-12-01', [row('2026-12-01')])],
-        { '2026-12-01': 'add' }, 127, weekdays, '2026-10-26'), /уже существует/);
+test('Историческая запись без будущих экземпляров не блокирует создание нового расписания', () => {
+    const plan = api.makeSchedulePlan([event(1, '2026-10-20')], [group('2026-12-01', [row('2026-12-01')])],
+        {}, 127, weekdays, '2026-10-26');
+    assert.deepEqual(Array.from(plan.operations, operation => operation.type), ['create']);
+});
+
+test('Ответ CRM с многолетней историей не блокирует замену шести действующих правил', () => {
+    const before = JSON.stringify(crmHistory);
+    const groups = [group('2026-11-02', [row('2026-11-02', { nfile: null })], [null])];
+    const [conflict] = api.findScheduleConflicts(crmHistory, groups, '2026-10-27');
+    assert.equal(conflict.count, 6);
+    assert.equal(conflict.weekly.length, 6);
+    assert.equal(conflict.historical.length, 10);
+    assert.ok(conflict.weekly.every(series => series.first && api.scheduleDay(series.first.ordersAcceptedAt) === '2026-11-02'));
+    const plan = api.makeSchedulePlan(crmHistory, groups, { '2026-11-02': 'replace' }, 11, weekdays, '2026-10-27');
+    const removals = plan.operations.filter(operation => operation.type === 'remove');
+    assert.equal(removals.length, 6);
+    assert.equal(plan.operations.filter(operation => operation.type === 'create').length, 1);
+    assert.ok(removals.every(operation => operation.future && api.scheduleDay(operation.event.ordersAcceptedAt) >= '2026-11-02'));
+    const oldIds = new Set(conflict.historical.map(series => String(series.instances[0].weeklyScheduleId)));
+    assert.ok(removals.every(operation => !oldIds.has(String(operation.event.weeklyScheduleId))));
+    assert.equal(JSON.stringify(crmHistory), before);
+});
+
+test('Правило с будущими записями до выбранной даты остаётся действующим и не удаляется через старый экземпляр', () => {
+    const records = [event(1, '2026-10-20', { weeklyScheduleId: 70 }), event(2, '2026-10-27', { weeklyScheduleId: 70 })];
+    const groups = [group('2026-12-01', [row('2026-12-01')])];
+    const [conflict] = api.findScheduleConflicts(records, groups, '2026-10-26');
+    assert.equal(conflict.weekly.length, 1);
+    assert.equal(conflict.historical.length, 0);
+    assert.equal(conflict.weekly[0].first, undefined);
+    assert.throws(() => api.makeSchedulePlan(records, groups, { '2026-12-01': 'replace' }, 127, weekdays, '2026-10-26'), /будущий экземпляр/);
+});
+
+test('Общее правило из прошлого не мешает заменять будущий день отдельного склада', () => {
+    const records = [event(1, '2026-10-20', { nfile: null }), event(2, '2026-10-27')];
+    const plan = api.makeSchedulePlan(records, [group('2026-10-27', [row()])], { '2026-10-27': 'replace' }, 127, weekdays, '2026-10-26');
+    assert.deepEqual(Array.from(plan.operations.filter(operation => operation.type === 'remove'), operation => operation.event.id), [2]);
 });
 
 test('Адаптер использует штатные функции и отклоняет ответ другого поставщика', async () => {

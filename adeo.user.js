@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADEO — прайсы и расписание поставщиков
 // @namespace    admin.adeo.pro
-// @version      3.3.2
+// @version      3.4.0
 // @description  Работа с прайсами и мастер еженедельного расписания поставщиков CRM
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
@@ -946,7 +946,8 @@
             event.orderDeliveryIntervalEnd ? scheduleTime(event.orderDeliveryIntervalEnd) : null]);
     }
 
-    function findScheduleConflicts(events, groups) {
+    function findScheduleConflicts(events, groups, today = scheduleDay()) {
+        parseScheduleDay(today);
         return groups.filter(group => group.enabled).map(group => {
             const series = new Map();
             const once = [];
@@ -959,18 +960,22 @@
                     series.get(key).push(event);
                 } else if (!isWeeklySchedule(event) && day === group.date) once.push(event);
             }
-            const weekly = [...series.values()].map(instances => ({
-                instances, first: instances.filter(event => scheduleDay(event.ordersAcceptedAt) >= group.date)
-                    .sort((a, b) => new Date(a.ordersAcceptedAt) - new Date(b.ordersAcceptedAt))[0]
-            }));
-            return { group, weekly, once, count: weekly.length + once.length };
+            const weekly = [], historical = [];
+            for (const instances of series.values()) {
+                // Список CRM содержит и закрытые повторы за прошлые годы. Их история не является конфликтом.
+                const future = instances.filter(event => scheduleDay(event.ordersAcceptedAt) > today);
+                if (!future.length) { historical.push({ instances }); continue; }
+                weekly.push({ instances, first: future.filter(event => scheduleDay(event.ordersAcceptedAt) >= group.date)
+                    .sort((a, b) => new Date(a.ordersAcceptedAt) - new Date(b.ordersAcceptedAt))[0] });
+            }
+            return { group, weekly, historical, once, count: weekly.length + once.length };
         });
     }
 
     function makeSchedulePlan(events, groups, decisions, supplierId, deliveryDays, today = scheduleDay()) {
         const operations = [];
         let skipped = 0;
-        const conflicts = findScheduleConflicts(events, groups);
+        const conflicts = findScheduleConflicts(events, groups, today);
         const removed = new Set();
         for (const conflict of conflicts) {
             const { group, weekly, once, count } = conflict;
@@ -1176,28 +1181,39 @@
         const style = document.createElement('style');
         style.id = 'adeo-schedule-styles';
         style.textContent = `
-            .adeo-schedule-launch,.adeo-schedule-clear{border:1px solid #1976d2;border-radius:5px;background:#1976d2;color:#fff;padding:9px 14px;cursor:pointer;margin:4px 10px;font:inherit}.adeo-schedule-clear{border-color:#b3261e;background:white;color:#b3261e}
-            .adeo-schedule-overlay{position:fixed;inset:0;background:#101e35a6;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:20px;color:#223047;font:14px/1.45 Arial,sans-serif}
-            .adeo-schedule-modal{background:#f5f7fb;width:min(1600px,98vw);max-height:94vh;display:flex;flex-direction:column;border-radius:12px;box-shadow:0 18px 70px #0005;overflow:hidden}
-            .adeo-schedule-header{background:#1976d2;color:white;padding:15px 22px;display:flex;align-items:center;gap:16px}
-            .adeo-schedule-header h2{font:600 20px/1.3 Arial;margin:0;flex:1;color:inherit}.adeo-schedule-close{background:transparent;color:white;border:0;font-size:25px;cursor:pointer;padding:3px 10px}
-            .adeo-schedule-content{padding:22px;overflow:auto;min-height:160px}.adeo-schedule-footer{padding:14px 22px;display:flex;gap:10px;justify-content:flex-end;border-top:1px solid #dce3ee;background:white;flex-wrap:wrap}
-            .adeo-schedule-overlay button,.adeo-schedule-overlay input,.adeo-schedule-overlay select{font:inherit;box-sizing:border-box}
-            .adeo-schedule-button{background:white;border:1px solid #bdcadd;border-radius:5px;color:#223047;padding:8px 12px;cursor:pointer}.adeo-schedule-button.primary{background:#1976d2;color:white;border-color:#1976d2}.adeo-schedule-button.danger{color:#b3261e}
-            .adeo-schedule-overlay button:disabled{opacity:.5;cursor:default}.adeo-schedule-overlay :focus-visible{outline:3px solid #efb73d;outline-offset:2px}
-            .adeo-schedule-field{display:flex;flex-direction:column;gap:4px;margin:9px 0;min-width:0}.adeo-schedule-field input,.adeo-schedule-field select{background:white;border:1px solid #bdcadd;border-radius:5px;padding:7px 8px;min-width:0;width:100%;color:#223047}
-            .adeo-schedule-check{display:inline-flex;align-items:center;gap:7px;margin:6px 16px 6px 0}.adeo-schedule-check input{width:17px;height:17px}.adeo-schedule-weekdays{display:flex;flex-wrap:wrap;gap:3px}
-            .adeo-schedule-box{padding:16px;background:white;border:1px solid #dce3ee;border-radius:8px;margin:12px 0}.adeo-schedule-box h3{font-size:16px;line-height:1.4;margin:0 0 10px;color:#223047}
-            .adeo-schedule-note{color:#53647c;margin:8px 0}.adeo-schedule-error{color:#a92323;white-space:pre-line;margin:8px 0}.adeo-schedule-error:empty{display:none}.adeo-schedule-success{color:#176238}
-            .adeo-schedule-grid{display:grid;grid-template-columns:repeat(7,minmax(205px,1fr));gap:10px;align-items:start;overflow-x:auto;padding-bottom:12px}
-            .adeo-schedule-day{background:white;border:1px solid #dce3ee;border-radius:8px;overflow:hidden}.adeo-schedule-day header{background:#e8eff9;padding:12px;font-weight:bold}.adeo-schedule-day header small{display:block;font-weight:normal;margin-top:3px}.adeo-schedule-day-body{padding:10px}
-            .adeo-schedule-row{border:1px solid #dce3ee;border-radius:6px;padding:10px;margin:10px 0;background:white}.adeo-schedule-row-tools{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}.adeo-schedule-row-tools button{padding:4px 8px}
-            details.adeo-schedule-row>summary{cursor:pointer;white-space:pre-line;font-size:13px;line-height:1.6}details.adeo-schedule-row[open]>summary{padding-bottom:8px;border-bottom:1px solid #dce3ee}.adeo-schedule-row-invalid{border-color:#c64343}.adeo-schedule-row-invalid>summary{color:#a92323}
-            .adeo-schedule-template{max-width:980px;display:grid;grid-template-columns:repeat(auto-fit,minmax(225px,1fr));gap:12px}.adeo-schedule-template .adeo-schedule-row{margin:0}
-            .adeo-schedule-mode{display:flex;gap:16px;flex-wrap:wrap}.adeo-schedule-mode button{flex:1;min-width:240px;text-align:left;padding:22px;font-size:18px}.adeo-schedule-mode small{display:block;font-size:14px;margin-top:9px}
-            .adeo-schedule-flex{display:flex;align-items:end;gap:12px;flex-wrap:wrap}.adeo-schedule-flex>.adeo-schedule-field{min-width:180px}.adeo-schedule-conflict{display:grid;grid-template-columns:minmax(150px,1fr) minmax(180px,2fr) minmax(150px,1fr);gap:14px;border-bottom:1px solid #dce3ee;padding:14px 0}
-            .adeo-schedule-progress{width:100%;height:18px}.adeo-schedule-step{font-size:13px;color:#dbeaff}.adeo-schedule-summary{font-weight:600;margin:12px 0}
-            @media(max-width:650px){.adeo-schedule-overlay{padding:5px}.adeo-schedule-modal{max-height:98vh;width:100%}.adeo-schedule-content{padding:12px}.adeo-schedule-header{padding:12px}.adeo-schedule-conflict{grid-template-columns:1fr}.adeo-schedule-footer{padding:10px}.adeo-schedule-grid{grid-template-columns:repeat(7,minmax(225px,1fr))}}
+            .adeo-schedule-launch,.adeo-schedule-clear{border:1px solid #1976d2;border-radius:7px;background:#1976d2;color:#fff;padding:9px 14px;cursor:pointer;margin:4px 6px;font:inherit}.adeo-schedule-clear{border-color:#d3b6b5;background:white;color:#b3261e}
+            .adeo-schedule-overlay{position:fixed;inset:0;background:#14243f99;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:20px;color:#24344a;font:14px/1.45 Arial,sans-serif;text-align:left;letter-spacing:normal}
+            .adeo-schedule-overlay,.adeo-schedule-overlay *{box-sizing:border-box}.adeo-schedule-overlay [hidden]{display:none!important}
+            .adeo-schedule-modal{--adeo-dialog-width:940px;background:#f6f8fc;width:var(--adeo-dialog-width);max-width:calc(100vw - 40px);max-height:calc(100dvh - 40px);min-height:0;display:flex;flex-direction:column;border-radius:14px;box-shadow:0 20px 80px #09182d4d;overflow:hidden;margin:0}
+            .adeo-schedule-modal[data-phase="template"]{--adeo-dialog-width:1260px}.adeo-schedule-modal[data-phase="review"][data-mode="new"]{--adeo-dialog-width:1680px}.adeo-schedule-modal[data-phase="confirm"],.adeo-schedule-modal[data-phase="clear-confirm"]{--adeo-dialog-width:1100px}.adeo-schedule-modal[data-view="copy-choice"]{width:640px}
+            .adeo-schedule-modal h2,.adeo-schedule-modal h3{letter-spacing:normal;text-transform:none;text-align:left;color:#24344a}.adeo-schedule-modal h3{font:600 18px/1.4 Arial,sans-serif;margin:0 0 12px}.adeo-schedule-modal p{font:inherit;letter-spacing:normal}
+            .adeo-schedule-header{background:#1976d2;color:white;padding:17px 24px;display:flex;align-items:center;gap:16px;flex-shrink:0}.adeo-schedule-header h2{font:600 20px/1.3 Arial,sans-serif;margin:0;flex:1;color:white}
+            .adeo-schedule-modal .adeo-schedule-close{background:#ffffff14;color:white;border:0;border-radius:7px;width:34px;height:34px;min-height:34px;font:25px/1 Arial,sans-serif;cursor:pointer;padding:0}.adeo-schedule-close:hover{background:#ffffff2b}
+            .adeo-schedule-steps{display:flex;align-items:center;gap:10px;padding:13px 24px;background:white;border-bottom:1px solid #e1e7f0;flex-shrink:0;overflow-x:auto}.adeo-schedule-step{display:flex;align-items:center;gap:7px;font:13px/1.3 Arial,sans-serif;color:#78869b;white-space:nowrap}.adeo-schedule-step b{display:grid;place-items:center;border:1px solid #d7dfeb;border-radius:50%;width:23px;height:23px;font:600 12px Arial}.adeo-schedule-step.current{color:#1565b7;font-weight:600}.adeo-schedule-step.current b{background:#1976d2;border-color:#1976d2;color:white}.adeo-schedule-step.done{color:#325e89}.adeo-schedule-step+.adeo-schedule-step:before{content:'›';color:#b4bfce;margin-right:3px}
+            .adeo-schedule-content{padding:22px 24px;overflow:auto;min-height:0;overscroll-behavior:contain;scrollbar-gutter:stable}.adeo-schedule-footer{padding:14px 24px;display:flex;gap:10px;justify-content:flex-end;align-items:center;border-top:1px solid #dce3ee;background:white;flex-shrink:0;flex-wrap:wrap}.adeo-schedule-footer:empty{display:none}.adeo-schedule-footer>:first-child:not(:only-child){margin-right:auto}
+            .adeo-schedule-overlay button,.adeo-schedule-overlay input,.adeo-schedule-overlay select{font:14px/1.3 Arial,sans-serif;letter-spacing:normal;text-transform:none;margin:0;box-shadow:none}.adeo-schedule-overlay button{width:auto;min-width:0}.adeo-schedule-button{background:white;border:1px solid #cbd5e3;border-radius:7px;color:#30445f;padding:9px 12px;min-height:38px;cursor:pointer;transition:background .12s,border-color .12s}.adeo-schedule-button:hover{background:#f1f6fd;border-color:#91afcf}.adeo-schedule-button.primary{background:#1976d2;color:white;border-color:#1976d2}.adeo-schedule-button.primary:hover{background:#1267bd}.adeo-schedule-button.danger{color:#b3261e;border-color:#e1c2c0}.adeo-schedule-button.danger:hover{background:#fff1f0;border-color:#ce9c98}
+            .adeo-schedule-overlay button:disabled{opacity:.45;cursor:default}.adeo-schedule-overlay :focus-visible{outline:3px solid #efb73d;outline-offset:2px}
+            .adeo-schedule-field{display:flex;flex-direction:column;gap:6px;margin:8px 0;min-width:0;font:13px/1.3 Arial,sans-serif;color:#50627b}.adeo-schedule-field input,.adeo-schedule-field select{background:white;border:1px solid #c9d4e3;border-radius:6px;padding:8px 9px;min-height:38px;min-width:0;width:100%;color:#24344a}.adeo-schedule-field select:disabled,.adeo-schedule-field input:disabled{background:#f1f3f7;color:#78869b}
+            .adeo-schedule-check{display:inline-flex;align-items:center;gap:7px;margin:6px 14px 6px 0;font:13px/1.4 Arial,sans-serif;cursor:pointer}.adeo-schedule-check input{width:16px;height:16px;min-height:0;flex-shrink:0;margin:0;accent-color:#1976d2}.adeo-schedule-check:has(input:disabled){color:#98a2b2;cursor:default}
+            .adeo-schedule-box{padding:17px 18px;background:white;border:1px solid #dfe6f0;border-radius:9px;margin:0 0 16px}.adeo-schedule-box h3{font:600 15px/1.4 Arial,sans-serif;margin:0 0 13px}.adeo-schedule-form-pair{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:20px}.adeo-schedule-setup-days{display:grid;grid-template-columns:1fr 1fr;gap:16px}.adeo-schedule-setup-days>.adeo-schedule-box{margin:0}
+            .adeo-schedule-weekdays{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px}.adeo-schedule-weekdays .adeo-schedule-check{flex-direction:column;justify-content:center;gap:7px;padding:10px 3px;margin:0;border:1px solid #dee5ee;background:#fafbfd;border-radius:7px;min-height:65px;color:#52637a}.adeo-schedule-weekdays .adeo-schedule-check:has(input:checked){background:#eaf3ff;border-color:#8fb8e4;color:#145fa9;font-weight:600}.adeo-schedule-weekdays .adeo-schedule-check:has(input:disabled){background:#f6f7f9;border-style:dashed;color:#a1aaba}.adeo-schedule-day-presets{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}.adeo-schedule-day-presets .adeo-schedule-button{min-height:28px;padding:4px 8px;font-size:12px}
+            .adeo-schedule-note{color:#65758d;margin:8px 0;font:13px/1.5 Arial,sans-serif}.adeo-schedule-error{color:#a92323;white-space:pre-line;margin:8px 0;font:13px/1.45 Arial,sans-serif}.adeo-schedule-error:empty{display:none}.adeo-schedule-content>[role="alert"]:not(:empty){padding:12px 15px;background:#fff1f0;border:1px solid #efc4c0;border-radius:8px;margin:0 0 16px;max-height:140px;overflow:auto}.adeo-schedule-success{color:#176238}
+            .adeo-schedule-grid{display:grid;grid-template-columns:repeat(7,minmax(168px,1fr));gap:9px;align-items:start;overflow-x:auto;padding-bottom:12px}.adeo-schedule-grid.copy{grid-template-columns:minmax(0,1fr)}.adeo-schedule-day{background:white;border:1px solid #dce3ee;border-radius:9px;overflow:hidden;min-width:0}.adeo-schedule-day header{background:#edf2fa;padding:12px;font:600 14px/1.4 Arial,sans-serif}.adeo-schedule-day header small{display:block;font:12px/1.5 Arial,sans-serif;color:#63758e;margin-top:3px}.adeo-schedule-day[data-enabled="false"]{background:#f8fafc}.adeo-schedule-day[data-enabled="false"] header{background:#f0f2f6;color:#8592a6}.adeo-schedule-day-body{padding:10px}.adeo-schedule-day-body>.adeo-schedule-check{margin:0 0 10px;font-size:12px}
+            .adeo-schedule-day-actions{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}.adeo-schedule-day-actions .adeo-schedule-button{flex:1;padding:6px 7px;min-height:32px;font-size:12px}.adeo-schedule-copy-tools{margin:0 0 10px;border-bottom:1px solid #e6ebf2;padding-bottom:8px}.adeo-schedule-copy-tools>summary{cursor:pointer;font:12px/1.4 Arial,sans-serif;color:#4b6d95;padding:5px 0}.adeo-schedule-copy-tools .adeo-schedule-field{font-size:12px}.adeo-schedule-copy-tools .adeo-schedule-button{font-size:12px;padding:6px 9px;min-height:32px}
+            .adeo-schedule-row{border:1px solid #dce3ee;border-radius:7px;padding:10px;margin:8px 0;background:white;min-width:0}.adeo-schedule-row-tools{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}.adeo-schedule-row-tools button{padding:5px 8px;min-height:30px;font-size:12px}.adeo-schedule-row-number{font:600 12px Arial,sans-serif;color:#8c9ab0;align-self:center}
+            details.adeo-schedule-row>summary{cursor:pointer;list-style:none;font:13px/1.4 Arial,sans-serif;position:relative;padding-right:16px}.adeo-schedule-modal summary::-webkit-details-marker{display:none}details.adeo-schedule-row>summary:after{content:'⌄';position:absolute;right:0;top:0;color:#7c8da6}details.adeo-schedule-row[open]>summary:after{content:'⌃'}details.adeo-schedule-row[open]>summary{padding-bottom:10px;border-bottom:1px solid #e2e8f1;margin-bottom:8px}.adeo-schedule-row-time{display:block;font:600 15px/1.4 Arial,sans-serif;color:#263f5b}.adeo-schedule-row-delivery-text{display:block;font:12px/1.5 Arial,sans-serif;color:#6a7a91;margin-top:3px}.adeo-schedule-row-issue{display:block;font:12px/1.4 Arial,sans-serif;color:#b3261e;margin-top:5px}.adeo-schedule-row-invalid{border-color:#e0a6a1;background:#fff8f7}.adeo-schedule-row-invalid .adeo-schedule-row-time{color:#a92323}
+            .adeo-schedule-grid.copy .adeo-schedule-row>summary{display:grid;grid-template-columns:minmax(160px,.8fr) minmax(200px,1.5fr);align-items:center;gap:8px}.adeo-schedule-grid.copy .adeo-schedule-row-delivery-text{margin:0;font-size:13px}.adeo-schedule-grid.copy .adeo-schedule-row-issue{grid-column:1/-1}.adeo-schedule-grid.copy details[open]>.adeo-schedule-field{max-width:300px}.adeo-schedule-grid.copy .adeo-schedule-row-delivery{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:end}.adeo-schedule-grid.copy .adeo-schedule-row-delivery>.adeo-schedule-button{grid-column:1/-1;justify-self:start}
+            .adeo-schedule-template{display:flex;flex-direction:column;gap:8px;max-width:none;width:100%}.adeo-schedule-template .adeo-schedule-row{display:grid;grid-template-columns:25px minmax(110px,1fr) 145px minmax(270px,2.2fr) auto;align-items:center;gap:14px;margin:0;padding:12px 14px}.adeo-schedule-template .adeo-schedule-field{margin:0}.adeo-schedule-template .adeo-schedule-check{margin:0}.adeo-schedule-template .adeo-schedule-row-delivery{display:grid;grid-template-columns:minmax(100px,1fr) minmax(150px,1.3fr);gap:14px}
+            .adeo-schedule-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 0;background:#f6f8fc;position:sticky;top:-22px;z-index:2;margin-bottom:6px}.adeo-schedule-toolbar strong{font-size:14px}.adeo-schedule-mode{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:14px}.adeo-schedule-mode .adeo-schedule-button{display:flex;flex-direction:column;align-items:start;text-align:left;padding:22px;min-height:150px;background:white;border:1px solid #d4e1f0;box-shadow:0 2px 6px #233d5f06;color:#243b58}.adeo-schedule-mode .adeo-schedule-button:hover{border-color:#74a6dc;background:#f5f9ff}.adeo-schedule-mode strong{font:600 17px/1.4 Arial,sans-serif}.adeo-schedule-mode small{display:block;font:13px/1.6 Arial,sans-serif;color:#6b7e96;margin-top:10px}.adeo-schedule-mode-icon{display:grid;place-items:center;width:32px;height:32px;border-radius:8px;background:#eaf3ff;color:#1976d2;font-size:20px;margin-bottom:12px}
+            .adeo-schedule-danger-zone{display:flex;gap:16px;align-items:center;justify-content:space-between;margin-top:20px;padding-top:16px;border-top:1px solid #e0e6ee}.adeo-schedule-danger-zone .adeo-schedule-note{margin:0;max-width:450px}
+            .adeo-schedule-flex{display:flex;align-items:end;gap:12px;flex-wrap:wrap}.adeo-schedule-flex>.adeo-schedule-field{min-width:180px}.adeo-schedule-summary{font:600 13px/1.5 Arial,sans-serif;margin:12px 0 16px;padding:12px 14px;border:1px solid #dce6f3;border-radius:8px;background:#edf4fe;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.adeo-schedule-summary.has-issues{background:#fff4ed;border-color:#f0d0b9;color:#945227}.adeo-schedule-summary .adeo-schedule-button{padding:5px 10px;min-height:30px;font-size:12px}
+            .adeo-schedule-settings{padding:12px 16px;background:white;border:1px solid #e0e7f1;border-radius:8px;margin:12px 0}.adeo-schedule-settings>summary{cursor:pointer;font:13px/1.5 Arial,sans-serif;color:#536e91}.adeo-schedule-settings>.adeo-schedule-box{border:0;padding:16px 0 0;margin:0}.adeo-schedule-settings[open]>summary{margin-bottom:4px}.adeo-schedule-bulkbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:12px 0 16px}.adeo-schedule-bulkbar .adeo-schedule-button{min-height:32px;padding:6px 10px;font-size:12px}
+            .adeo-schedule-conflict{background:white;border:1px solid #dce4ee;border-radius:9px;padding:16px 18px;margin:12px 0}.adeo-schedule-conflict-head{display:grid;grid-template-columns:minmax(145px,1fr) minmax(180px,1.2fr) minmax(180px,1fr);align-items:center;gap:18px}.adeo-schedule-conflict-head strong{font-size:14px}.adeo-schedule-conflict-head .adeo-schedule-field{margin:0}.adeo-schedule-conflict-details{margin-top:12px}.adeo-schedule-conflict-details>summary{cursor:pointer;color:#536e91;font:13px/1.5 Arial,sans-serif;padding:5px 0}.adeo-schedule-history{border-top:1px dashed #dfe5ed;padding-top:8px}.adeo-schedule-warning{color:#8a5c21;background:#fff8e9;border:1px solid #efdfb9;border-radius:6px;padding:9px 12px;margin:10px 0;font:13px/1.5 Arial,sans-serif}
+            .adeo-schedule-table-wrap{overflow:auto;margin-top:8px;max-height:340px}.adeo-schedule-table{border-collapse:collapse;width:100%;font:13px/1.5 Arial,sans-serif;white-space:nowrap}.adeo-schedule-table th,.adeo-schedule-table td{text-align:left;padding:8px 12px;border:0;border-bottom:1px solid #e8edf4;background:white;color:#50627b;font:13px/1.5 Arial,sans-serif}.adeo-schedule-table th{font-weight:600;background:#f3f6fa;color:#516781;position:sticky;top:0}.adeo-schedule-table td:first-child{font-weight:600;color:#294360}
+            .adeo-schedule-progress{width:100%;height:14px;accent-color:#1976d2;margin:10px 0}.adeo-schedule-progress-panel{padding:20px;border:1px solid #dce5ef;background:white;border-radius:9px}
+            @media(max-width:1100px){.adeo-schedule-grid{grid-template-columns:repeat(7,minmax(180px,1fr))}.adeo-schedule-grid.copy{grid-template-columns:1fr}.adeo-schedule-template .adeo-schedule-row{gap:10px;grid-template-columns:22px minmax(100px,1fr) 130px minmax(250px,2fr) auto}.adeo-schedule-row-tools{gap:4px}}
+            @media(max-width:820px){.adeo-schedule-overlay{padding:8px}.adeo-schedule-modal{max-width:calc(100vw - 16px);max-height:calc(100dvh - 16px)}.adeo-schedule-content{padding:16px}.adeo-schedule-header{padding:14px 16px}.adeo-schedule-steps{padding:11px 16px;gap:6px}.adeo-schedule-step{font-size:12px}.adeo-schedule-setup-days{grid-template-columns:1fr}.adeo-schedule-conflict-head{grid-template-columns:1fr 1fr}.adeo-schedule-conflict-head>.adeo-schedule-field{grid-column:1/-1}.adeo-schedule-footer{padding:12px 16px}.adeo-schedule-template .adeo-schedule-row{grid-template-columns:25px 1fr 1fr}.adeo-schedule-template .adeo-schedule-row-delivery{grid-column:2/-1}.adeo-schedule-template .adeo-schedule-row-tools{grid-column:2/-1}.adeo-schedule-toolbar{top:-16px}.adeo-schedule-mode .adeo-schedule-button{padding:16px}.adeo-schedule-danger-zone{align-items:start}.adeo-schedule-grid.copy .adeo-schedule-row>summary{grid-template-columns:1fr}}
+            @media(max-width:520px){.adeo-schedule-form-pair,.adeo-schedule-mode{grid-template-columns:1fr;gap:12px}.adeo-schedule-header h2{font-size:17px}.adeo-schedule-modal h3{font-size:17px}.adeo-schedule-box{padding:14px}.adeo-schedule-danger-zone{flex-direction:column}.adeo-schedule-footer .adeo-schedule-button{max-width:100%}.adeo-schedule-check{font-size:12px}.adeo-schedule-template .adeo-schedule-row{padding:10px;gap:8px}.adeo-schedule-template .adeo-schedule-row-delivery{grid-template-columns:1fr}.adeo-schedule-weekdays{gap:4px}.adeo-schedule-step b{display:none}.adeo-schedule-day-presets{gap:4px}.adeo-schedule-weekdays .adeo-schedule-check{padding:8px 2px}.adeo-schedule-grid.copy .adeo-schedule-row-delivery{grid-template-columns:1fr}}
         `;
         document.head.append(style);
     }
@@ -1207,6 +1223,17 @@
         if (text !== undefined && text !== null) element.textContent = text;
         if (className) element.className = className;
         return element;
+    }
+
+    function displayScheduleDay(value, withYear = true) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(value || '')) return value || 'Укажите дату';
+        return `${value.slice(8, 10)}.${value.slice(5, 7)}${withYear ? `.${value.slice(0, 4)}` : ''}`;
+    }
+
+    function scheduleEntryCount(count) {
+        const ending = count % 100 >= 11 && count % 100 <= 14 ? 'записей'
+            : count % 10 === 1 ? 'запись' : count % 10 >= 2 && count % 10 <= 4 ? 'записи' : 'записей';
+        return `${count} ${ending}`;
     }
 
     async function openScheduleWizard(calendar, launcher, initialMode = '') {
@@ -1233,8 +1260,9 @@
         header.append(heading, closeButton);
         const content = scheduleElement('div', null, 'adeo-schedule-content');
         const footer = scheduleElement('div', null, 'adeo-schedule-footer');
+        const steps = scheduleElement('nav', null, 'adeo-schedule-steps'); steps.setAttribute('aria-label', 'Шаги работы с расписанием');
         const errorBox = scheduleElement('div', '', 'adeo-schedule-error'); errorBox.setAttribute('role', 'alert');
-        modal.append(header, content, footer); overlay.append(modal);
+        modal.append(header, steps, content, footer); overlay.append(modal);
         const host = calendar.closest('.q-dialog__inner') || document.body;
         const previousOverflow = document.body.style.overflow;
         document.body.style.overflow = 'hidden'; host.append(overlay); modal.focus();
@@ -1255,7 +1283,7 @@
             if (!overlay.isConnected) return;
             if (event.key === 'Escape') { event.preventDefault(); event.stopImmediatePropagation(); close(); }
             if (event.key === 'Tab') {
-                const focusable = [...modal.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),[tabindex="0"]')].filter(node => node.getClientRects().length);
+                const focusable = [...modal.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),summary,[tabindex="0"]')].filter(node => node.getClientRects().length);
                 if (!focusable.length) { event.preventDefault(); modal.focus(); return; }
                 const first = focusable[0], last = focusable[focusable.length - 1];
                 if (event.shiftKey && (document.activeElement === first || document.activeElement === modal)) { event.preventDefault(); last.focus(); }
@@ -1269,7 +1297,7 @@
         function setBusy(value) {
             state.busy = value; closeButton.disabled = value;
             modal.setAttribute('aria-busy', String(value));
-            for (const input of content.querySelectorAll('input,select')) {
+            for (const input of [...content.querySelectorAll('button,input,select'), ...footer.querySelectorAll('button')]) {
                 if (value) { input.dataset.schedulePreviousDisabled = String(input.disabled); input.disabled = true; }
                 else if ('schedulePreviousDisabled' in input.dataset) {
                     input.disabled = input.dataset.schedulePreviousDisabled === 'true'; delete input.dataset.schedulePreviousDisabled;
@@ -1302,7 +1330,7 @@
             const wrapper = scheduleElement('label', null, 'adeo-schedule-field'); wrapper.append(scheduleElement('span', label));
             const input = scheduleElement('select');
             input.setAttribute('aria-label', label);
-            for (const choice of choices) { const option = scheduleElement('option', choice.label); option.value = choice.value; input.append(option); }
+            for (const choice of choices) { const option = scheduleElement('option', choice.label); option.value = choice.value; option.disabled = Boolean(choice.disabled); input.append(option); }
             input.value = value ?? '';
             input.addEventListener('change', () => {
                 if (state.busy) return;
@@ -1313,6 +1341,7 @@
         }
         function check(parent, label, checked, change, disabled = false) {
             const wrapper = scheduleElement('label', null, 'adeo-schedule-check'); const input = scheduleElement('input'); input.type = 'checkbox'; input.checked = checked; input.disabled = disabled;
+            input.setAttribute('aria-label', label);
             input.addEventListener('change', () => {
                 if (state.busy) return;
                 state.dirty = true;
@@ -1322,11 +1351,25 @@
         function weekdays(parent, label, property, delivery = false) {
             const box = scheduleElement('div', null, 'adeo-schedule-box'); box.append(scheduleElement('h3', label));
             const choices = scheduleElement('div', null, 'adeo-schedule-weekdays');
-            SCHEDULE_WEEKDAYS.forEach((name, day) => check(choices, name, state[property].includes(day), checked => {
-                state[property] = checked ? [...state[property], day].sort() : state[property].filter(value => value !== day);
+            SCHEDULE_WEEKDAYS.forEach((name, day) => {
+                const input = check(choices, name, state[property].includes(day), checked => {
+                    state[property] = checked ? [...state[property], day].sort() : state[property].filter(value => value !== day);
+                    if (state.phase === 'review') updateReviewErrors();
+                }, delivery && day === 6);
+                input.parentElement.querySelector('span').textContent = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'][day];
+                input.parentElement.title = name;
+            });
+            box.append(choices);
+            const presets = scheduleElement('div', null, 'adeo-schedule-day-presets');
+            const apply = days => {
+                state[property] = days; state.dirty = true;
+                choices.querySelectorAll('input').forEach((input, day) => { input.checked = days.includes(day); });
                 if (state.phase === 'review') updateReviewErrors();
-            }, delivery && day === 6));
-            box.append(choices); if (delivery) note(box, 'Дни приезда на ваш склад. Воскресенье закрыто, в субботу приёмка до 16:00.'); parent.append(box);
+            };
+            button(presets, 'Будни', () => apply([0, 1, 2, 3, 4]));
+            button(presets, delivery ? 'Пн–Сб' : 'Все дни', () => apply(delivery ? [0, 1, 2, 3, 4, 5] : [0, 1, 2, 3, 4, 5, 6]));
+            button(presets, 'Снять выбор', () => apply([])); box.append(presets);
+            if (delivery) note(box, 'Будни — круглосуточно. Суббота — до 16:00. Воскресенье — выходной.'); parent.append(box);
         }
         function freshTemplate() { return { uid: String(++scheduleDraftSequence), sendTime: '09:00', leadDays: 1, deliveryHour: 15, haveDelivery: true }; }
         function allDrafts() { return state.groups.filter(group => group.enabled).flatMap(group => group.entries); }
@@ -1343,24 +1386,38 @@
             return errors;
         }
         function updateReviewErrors() {
-            for (const row of allDrafts()) {
+            for (const group of state.groups.filter(item => item.enabled)) for (const row of group.entries) {
                 const box = content.querySelector(`[data-schedule-error="${row.uid}"]`);
                 const errors = validateScheduleDraft(row, state.deliveryDays);
+                if (group.entries.some(other => other !== row && other.sendTime === row.sendTime && scheduleScopesOverlap(other.nfile, row.nfile))) {
+                    errors.push('На это время уже есть другая отправка для пересекающихся складов. Измените время или удалите лишнюю запись.');
+                }
                 if (box) box.textContent = errors.join(' ');
                 const summary = content.querySelector(`[data-schedule-row-summary="${row.uid}"]`);
                 if (summary) {
-                    const warehouse = state.mode === 'copy' ? ` · склад ${scheduleNfile(row.nfile) || 'все'}` : '';
-                    summary.textContent = `${row.sendTime || 'Укажите время'}${warehouse}\n${row.haveDelivery ? `${row.deliveryDate || 'Укажите дату'} ${scheduleHourLabel(row.deliveryHour)}` : 'Без доставки'}${errors.length ? '\n⚠ Требует исправления' : ''}`;
+                    const warehouse = state.mode === 'copy' ? (scheduleNfile(row.nfile) ? ` · склад ${row.nfile}` : ' · все склады') : '';
+                    summary.replaceChildren(
+                        scheduleElement('span', `${row.sendTime || 'Укажите время'}${warehouse}`, 'adeo-schedule-row-time'),
+                        scheduleElement('span', row.haveDelivery ? `${displayScheduleDay(row.deliveryDate, false)} · ${scheduleHourLabel(row.deliveryHour)}` : 'Без доставки', 'adeo-schedule-row-delivery-text')
+                    );
+                    if (errors.length) summary.append(scheduleElement('span', 'Требует исправления', 'adeo-schedule-row-issue'));
                     summary.parentElement.classList.toggle('adeo-schedule-row-invalid', errors.length > 0);
                 }
             }
             const summary = content.querySelector('[data-schedule-summary]');
-            if (summary) summary.textContent = `Записей: ${allDrafts().length}. Дней для изменения: ${state.groups.filter(group => group.enabled).length}. Замечаний: ${reviewErrors().length}.`;
+            if (summary) {
+                const count = reviewErrors().length;
+                summary.querySelector('[data-schedule-summary-text]').textContent = `Записей: ${allDrafts().length}. Дней для изменения: ${state.groups.filter(group => group.enabled).length}. Замечаний: ${count}.`;
+                summary.classList.toggle('has-issues', count > 0);
+                summary.querySelector('button').hidden = !count;
+            }
             const fixes = content.querySelector('[data-schedule-saturday-fix]');
             if (fixes) { fixes.replaceChildren(); renderSaturdayFix(fixes); }
         }
         function renderRow(parent, row, entries, template = false) {
             const box = scheduleElement(template ? 'div' : 'details', null, 'adeo-schedule-row');
+            box.dataset.scheduleRow = row.uid;
+            if (template) box.append(scheduleElement('span', schedulePad(entries.indexOf(row) + 1), 'adeo-schedule-row-number'));
             if (!template) {
                 const summary = scheduleElement('summary'); summary.dataset.scheduleRowSummary = row.uid; box.append(summary);
                 box.open = Boolean(row.expanded); box.addEventListener('toggle', () => { row.expanded = box.open; });
@@ -1368,7 +1425,7 @@
             if (!template && state.mode === 'copy') note(box, `Склад: ${scheduleNfile(row.nfile) || 'все (общая запись)'}`);
             const update = () => { if (!template) updateReviewErrors(); };
             field(box, 'Отправка заказа', 'time', row.sendTime, value => { row.sendTime = value; update(); }, { step: '60', required: '' });
-            const deliveryControls = scheduleElement('div');
+            const deliveryControls = scheduleElement('div', null, 'adeo-schedule-row-delivery');
             check(box, 'Указать доставку', row.haveDelivery, value => {
                 row.haveDelivery = value;
                 if (!template && value && !row.deliveryDate) row.deliveryDate = nextScheduleDelivery(row.sendDate, state.deliveryDays);
@@ -1394,13 +1451,15 @@
         function renderSetup() {
             if (state.mode === 'new') {
                 const box = scheduleElement('div', null, 'adeo-schedule-box'); box.append(scheduleElement('h3', '1. Склад и дата начала'));
-                select(box, 'Номер склада', scheduleNfile(state.nfile), [{ value: '', label: 'Все склады — общее правило' }, ...state.storages.map(storage => ({
+                const fields = scheduleElement('div', null, 'adeo-schedule-form-pair');
+                select(fields, 'Номер склада', scheduleNfile(state.nfile), [{ value: '', label: 'Все склады — общее правило' }, ...state.storages.map(storage => ({
                     value: String(storage.nfile), label: `${storage.nfile}${storage.name ? ` — ${storage.name}` : ''}`
                 }))], value => { state.nfile = value === '' ? null : state.storages.find(storage => String(storage.nfile) === value)?.nfile ?? value; });
-                note(box, '«Все склады» пересекается с расписаниями отдельных складов. При замене будут показаны и затронуты правила всех складов выбранного дня недели.');
-                field(box, 'Начать с', 'date', state.startDate, value => { state.startDate = value; }, { min: addScheduleDays(scheduleDay(), 1) }); content.append(box);
-                weekdays(content, '2. Когда отправлять заказы поставщику', 'orderDays');
-                weekdays(content, '3. Когда поставщик может привезти товар', 'deliveryDays', true);
+                field(fields, 'Начать с', 'date', state.startDate, value => { state.startDate = value; }, { min: addScheduleDays(scheduleDay(), 1) }); box.append(fields);
+                note(box, 'Склад применяется ко всем записям. Если выбраны все склады, перед заменой покажем расписания каждого из них.'); content.append(box);
+                const days = scheduleElement('div', null, 'adeo-schedule-setup-days');
+                weekdays(days, '2. Когда отправлять заказы поставщику', 'orderDays');
+                weekdays(days, '3. Когда поставщик может привезти товар', 'deliveryDays', true); content.append(days);
                 button(footer, 'Далее: заполнить день', () => {
                     parseScheduleDay(state.startDate);
                     if (state.startDate <= scheduleDay()) throw new Error('Выберите дату начала не раньше завтра.');
@@ -1409,8 +1468,9 @@
                 }, 'primary');
             } else {
                 const box = scheduleElement('div', null, 'adeo-schedule-box'); box.append(scheduleElement('h3', 'Копирование еженедельных записей'));
-                field(box, 'Из какого дня', 'date', state.sourceDate, value => { state.sourceDate = value; });
-                field(box, 'В какой день', 'date', state.targetDate, value => { state.targetDate = value; }, { min: addScheduleDays(scheduleDay(), 1) });
+                const fields = scheduleElement('div', null, 'adeo-schedule-form-pair');
+                field(fields, 'Из какого дня', 'date', state.sourceDate, value => { state.sourceDate = value; });
+                field(fields, 'В какой день', 'date', state.targetDate, value => { state.targetDate = value; }, { min: addScheduleDays(scheduleDay(), 1) }); box.append(fields);
                 note(box, 'Копируются только еженедельные записи загруженного дня, со всеми исходными складами. Все даты сдвигаются на одинаковое число дней.'); content.append(box);
                 weekdays(content, 'Допустимые дни доставки для проверки копии', 'deliveryDays', true);
                 button(footer, 'Подготовить копию', async () => {
@@ -1452,31 +1512,50 @@
         }
 
         function renderReview() {
-            note(content, 'Предпросмотр еженедельного расписания. У каждого дня указана первая будущая дата; записи появятся начиная с неё. Все правки пока остаются в мастере.');
-            if (state.mode === 'copy') weekdays(content, 'Разрешённые дни доставки', 'deliveryDays', true);
-            const summary = scheduleElement('p', '', 'adeo-schedule-summary'); summary.dataset.scheduleSummary = ''; content.append(summary);
+            note(content, state.mode === 'copy' ? 'Проверьте копию перед сохранением. Нажмите на запись, чтобы изменить время или доставку.' : 'У каждого дня указана первая дата отправки. Раскройте запись для редактирования; изменения сохранятся после общей проверки.');
+            if (state.mode === 'copy') {
+                const settings = scheduleElement('details', null, 'adeo-schedule-settings');
+                settings.append(scheduleElement('summary', 'Дни доставки и часы приёмки · изменить'));
+                weekdays(settings, 'Разрешённые дни доставки', 'deliveryDays', true); content.append(settings);
+            }
+            const summary = scheduleElement('div', null, 'adeo-schedule-summary'); summary.dataset.scheduleSummary = '';
+            const stats = scheduleElement('span'); stats.dataset.scheduleSummaryText = ''; summary.append(stats);
+            button(summary, 'К первой ошибке', () => {
+                const row = content.querySelector('.adeo-schedule-row-invalid');
+                if (!row) return;
+                row.open = true; row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                row.querySelector('input')?.focus({ preventScroll: true });
+            }); content.append(summary);
             const fixes = scheduleElement('div'); fixes.dataset.scheduleSaturdayFix = ''; content.append(fixes);
-            const grid = scheduleElement('div', null, 'adeo-schedule-grid'); if (state.mode === 'copy') grid.style.gridTemplateColumns = 'minmax(260px,600px)';
+            const grid = scheduleElement('div', null, `adeo-schedule-grid${state.mode === 'copy' ? ' copy' : ''}`);
             for (const group of state.groups) {
                 const day = scheduleElement('section', null, 'adeo-schedule-day'); const dayHeader = scheduleElement('header', SCHEDULE_WEEKDAYS[group.weekday]);
-                dayHeader.append(scheduleElement('small', group.date)); const body = scheduleElement('div', null, 'adeo-schedule-day-body');
+                day.dataset.enabled = String(group.enabled);
+                dayHeader.append(scheduleElement('small', `${displayScheduleDay(group.date)} · ${scheduleEntryCount(group.entries.length)}`)); const body = scheduleElement('div', null, 'adeo-schedule-day-body');
                 if (state.mode === 'new') check(body, 'Изменять этот день', group.enabled, checked => { group.enabled = checked; state.dirty = true; render(); });
                 if (group.enabled) {
-                    button(body, '＋ Добавить запись', () => {
+                    const actions = scheduleElement('div', null, 'adeo-schedule-day-actions');
+                    const add = button(actions, '＋ Добавить запись', () => {
                         group.entries.push({ uid: String(++scheduleDraftSequence), nfile: state.mode === 'new' ? state.nfile : group.nfiles[0],
                             sendDate: group.date, sendTime: '09:00', haveDelivery: true, deliveryDate: nextScheduleDelivery(addScheduleDays(group.date, 1), state.deliveryDays), deliveryHour: 15, expanded: true }); state.dirty = true; render();
                     });
+                    add.setAttribute('aria-label', '＋ Добавить запись'); add.textContent = '＋ Запись'; add.title = 'Добавить запись в этот день';
                     if (state.mode === 'new') {
                         const nextDay = state.groups.find(item => item.date === addScheduleDays(group.date, 1));
-                        if (nextDay) button(body, 'На следующий день', () => requestDraftCopy(group, nextDay));
+                        if (nextDay) {
+                            const next = button(actions, 'На следующий день', () => requestDraftCopy(group, nextDay));
+                            next.setAttribute('aria-label', 'На следующий день'); next.textContent = 'Копия →'; next.title = `Скопировать в ${SCHEDULE_WEEKDAYS[nextDay.weekday].toLowerCase()}, ${displayScheduleDay(nextDay.date)}`;
+                        }
+                        body.append(actions);
+                        const copy = scheduleElement('details', null, 'adeo-schedule-copy-tools'); copy.append(scheduleElement('summary', 'В другой день…'));
                         let target = '';
-                        select(body, 'Скопировать весь день в', '', [{ value: '', label: 'Выберите день' }, ...state.groups.filter(item => item !== group).map(item => ({ value: item.date, label: `${SCHEDULE_WEEKDAYS[item.weekday]} ${item.date}` }))], value => { target = value; });
-                        button(body, 'Копировать день', () => {
+                        select(copy, 'Скопировать весь день в', '', [{ value: '', label: 'Выберите день' }, ...state.groups.filter(item => item !== group).map(item => ({ value: item.date, label: `${SCHEDULE_WEEKDAYS[item.weekday]} ${displayScheduleDay(item.date)}` }))], value => { target = value; });
+                        button(copy, 'Копировать день', () => {
                             const destination = state.groups.find(item => item.date === target);
                             if (!destination) throw new Error('Выберите день назначения.');
                             requestDraftCopy(group, destination);
-                        });
-                    }
+                        }); body.append(copy);
+                    } else body.append(actions);
                     if (!group.entries.length) note(body, 'Нет отправок. При замене существующее расписание этого дня будет очищено.');
                     group.entries.forEach(row => renderRow(body, row, group.entries));
                 }
@@ -1494,8 +1573,9 @@
         }
 
         function renderDraftCopyChoice(source, destination) {
+            modal.dataset.view = 'copy-choice';
             content.replaceChildren(); footer.replaceChildren(); content.append(errorBox);
-            content.append(scheduleElement('h3', `День ${destination.date} уже заполнен в черновике`));
+            content.append(scheduleElement('h3', `${SCHEDULE_WEEKDAYS[destination.weekday]}, ${displayScheduleDay(destination.date)} — день уже заполнен`));
             note(content, 'Выберите, как скопировать записи. В CRM ничего не изменится до общего сохранения.');
             const copy = replace => {
                 const copied = copyScheduleDrafts(source.entries, source.date, destination.date);
@@ -1505,7 +1585,7 @@
         }
 
         async function prepareSave() {
-            const errors = reviewErrors(); if (errors.length) throw new Error(errors.slice(0, 8).join('\n'));
+            const errors = reviewErrors(); if (errors.length) throw new Error(`Перед сохранением исправьте замечания: ${errors.length}. Раскройте выделенные записи или нажмите «К первой ошибке».`);
             if (!state.groups.some(group => group.enabled)) throw new Error('Выберите хотя бы один день для изменения.');
             assertContext(); setBusy(true);
             try {
@@ -1514,9 +1594,19 @@
             } finally { setBusy(false); render(); }
         }
 
-        function describeEvent(event) {
-            const delivery = event.orderDeliveryIntervalStart ? `${scheduleDay(event.orderDeliveryIntervalStart)} ${scheduleTime(event.orderDeliveryIntervalStart)}–${scheduleTime(event.orderDeliveryIntervalEnd)}` : 'без доставки';
-            return `${scheduleTime(event.ordersAcceptedAt)}, склад ${scheduleNfile(event.nfile) || 'все (общее правило)'} → ${delivery}`;
+        function scheduleTable(parent, rows) {
+            const wrapper = scheduleElement('div', null, 'adeo-schedule-table-wrap');
+            const table = scheduleElement('table', null, 'adeo-schedule-table');
+            const head = scheduleElement('thead'), headings = scheduleElement('tr');
+            for (const name of ['Отправка', 'Склад', 'Доставка', 'Запись']) { const cell = scheduleElement('th', name); cell.scope = 'col'; headings.append(cell); }
+            head.append(headings); const body = scheduleElement('tbody');
+            for (const { event, label } of rows) {
+                const row = scheduleElement('tr');
+                const delivery = event.orderDeliveryIntervalStart ? `${displayScheduleDay(scheduleDay(event.orderDeliveryIntervalStart))} · ${scheduleTime(event.orderDeliveryIntervalStart)}–${scheduleTime(event.orderDeliveryIntervalEnd)}` : 'Без доставки';
+                for (const value of [`${displayScheduleDay(scheduleDay(event.ordersAcceptedAt))} · ${scheduleTime(event.ordersAcceptedAt)}`, scheduleNfile(event.nfile) || 'Все', delivery, label]) row.append(scheduleElement('td', value));
+                body.append(row);
+            }
+            table.append(head, body); wrapper.append(table); parent.append(wrapper);
         }
 
         function renderConfirm() {
@@ -1528,23 +1618,42 @@
             }
             if (!conflicts.length) note(content, 'Существующих записей в выбранных днях и складах не найдено. Можно сохранить подготовленное расписание.');
             else {
-                const bulk = scheduleElement('div', null, 'adeo-schedule-flex');
+                const bulk = scheduleElement('div', null, 'adeo-schedule-bulkbar');
+                bulk.append(scheduleElement('span', 'Для всех дней с конфликтами:'));
+                const canReplace = conflict => !scheduleReplacesGeneralRule(conflict) && conflict.weekly.every(series => Boolean(series.first));
                 for (const [value, label] of [['add', 'Везде добавить'], ['replace', 'Везде заменить'], ['skip', 'Везде пропустить']]) {
-                    button(bulk, label, () => { conflicts.forEach(item => { state.decisions[item.group.date] = value; }); render(); });
+                    const control = button(bulk, label, () => { conflicts.forEach(item => { state.decisions[item.group.date] = value; }); render(); });
+                    if (value === 'replace' && conflicts.some(item => !canReplace(item))) { control.disabled = true; control.title = 'Для части дней замена недоступна. Причина указана в карточке дня.'; }
                 }
                 content.append(bulk);
                 for (const conflict of conflicts) {
                     const box = scheduleElement('div', null, 'adeo-schedule-conflict');
-                    box.append(scheduleElement('strong', `${SCHEDULE_WEEKDAYS[scheduleWeekday(conflict.group.date)]}, с ${conflict.group.date}`));
-                    const details = scheduleElement('div');
-                    note(details, `Существующих правил: ${conflict.count}. Новых записей: ${conflict.group.entries.length}.`);
-                    for (const series of conflict.weekly) note(details, `Еженедельно: ${describeEvent(series.first || series.instances[0])}${series.first ? '' : ' — будущий экземпляр пока не загружен, замена недоступна'}`);
-                    for (const event of conflict.once) note(details, `Разовая: ${describeEvent(event)}`);
-                    if (scheduleReplacesGeneralRule(conflict)) note(details, 'Общее правило действует на все склады. Его удаление при замене только одного склада заблокировано.');
-                    box.append(details);
-                    select(box, 'Действие', state.decisions[conflict.group.date] || '', [
-                        { value: '', label: 'Выберите действие' }, { value: 'add', label: 'Добавить' }, { value: 'replace', label: 'Заменить' }, { value: 'skip', label: 'Пропустить день' }
-                    ], value => { state.decisions[conflict.group.date] = value; }); content.append(box);
+                    const top = scheduleElement('div', null, 'adeo-schedule-conflict-head');
+                    top.append(scheduleElement('strong', `${SCHEDULE_WEEKDAYS[scheduleWeekday(conflict.group.date)]}\nс ${displayScheduleDay(conflict.group.date)}`));
+                    top.append(scheduleElement('span', `Существующих правил: ${conflict.count}. Новых записей: ${conflict.group.entries.length}.`, 'adeo-schedule-note'));
+                    select(top, 'Действие', state.decisions[conflict.group.date] || '', [
+                        { value: '', label: 'Выберите действие' }, { value: 'add', label: 'Добавить' }, { value: 'replace', label: 'Заменить', disabled: !canReplace(conflict) }, { value: 'skip', label: 'Пропустить день' }
+                    ], value => { state.decisions[conflict.group.date] = value; }); box.append(top);
+                    const active = [...conflict.weekly.filter(series => series.first).map(series => ({ event: series.first, label: 'Еженедельно' })), ...conflict.once.map(event => ({ event, label: 'Разовая' }))];
+                    if (active.length) {
+                        const details = scheduleElement('details', null, 'adeo-schedule-conflict-details'); details.open = conflicts.length === 1;
+                        details.append(scheduleElement('summary', `Будущие записи · ${active.length}`)); scheduleTable(details, active); box.append(details);
+                    }
+                    const unavailable = conflict.weekly.filter(series => !series.first);
+                    if (unavailable.length) {
+                        box.append(scheduleElement('p', `Для ${unavailable.length} действующих правил CRM не вернула экземпляр начиная с выбранной даты. Замена этого дня пока недоступна; выберите дату ближе или пропустите день.`, 'adeo-schedule-warning'));
+                        const details = scheduleElement('details', null, 'adeo-schedule-conflict-details');
+                        details.append(scheduleElement('summary', `Действующие правила без экземпляра на выбранную дату · ${unavailable.length}`));
+                        scheduleTable(details, unavailable.map(series => ({ event: series.instances.at(-1), label: 'Нет экземпляра на дату' }))); box.append(details);
+                    }
+                    if (conflict.historical.length) {
+                        const details = scheduleElement('details', null, 'adeo-schedule-conflict-details adeo-schedule-history');
+                        details.append(scheduleElement('summary', `История · ${conflict.historical.length} правил без будущих отправок (не изменяется)`));
+                        note(details, 'Эти записи относятся к прошедшим датам. Они не участвуют в замене и не блокируют её.');
+                        scheduleTable(details, conflict.historical.map(series => ({ event: series.instances.at(-1), label: 'Только история' }))); box.append(details);
+                    }
+                    if (scheduleReplacesGeneralRule(conflict)) box.append(scheduleElement('p', 'Общее правило действует на все склады. Его удаление при замене только одного склада заблокировано.', 'adeo-schedule-warning'));
+                    content.append(box);
                 }
             }
             button(footer, 'Отмена — к черновику', () => { state.phase = 'review'; render(); });
@@ -1564,14 +1673,10 @@
         function renderClearConfirm() {
             const plan = makeScheduleClearPlan(state.events, supplierId);
             content.append(scheduleElement('h3', 'Очистка всего будущего расписания'));
-            note(content, `Поставщик: ${proxy.supplier.cella || supplierId}. Все склады, начиная с ${addScheduleDays(scheduleDay(), 1)}.`);
+            note(content, `Поставщик: ${proxy.supplier.cella || supplierId}. Все склады, начиная с ${displayScheduleDay(addScheduleDays(scheduleDay(), 1))}.`);
             note(content, 'Будут удалены разовые отправки и прекращены все показанные еженедельные повторы. Сегодняшние и прошедшие записи сохранятся.');
             content.append(scheduleElement('p', `Еженедельных правил: ${plan.ruleCount}. Разовых записей: ${plan.onceCount}. Будущих отправок в загруженном расписании: ${plan.futureCount}.`, 'adeo-schedule-summary'));
-            for (const operation of plan.operations) {
-                const box = scheduleElement('div', null, 'adeo-schedule-box');
-                box.append(scheduleElement('strong', `${operation.future ? 'Повтор, начиная с ' : 'Разовая запись: '}${scheduleDay(operation.event.ordersAcceptedAt)}`));
-                note(box, describeEvent(operation.event)); content.append(box);
-            }
+            if (plan.operations.length) scheduleTable(content, plan.operations.map(operation => ({ event: operation.event, label: operation.future ? 'Прекратить повторы' : 'Удалить разовую' })));
             if (!plan.operations.length) note(content, 'В загруженном расписании нет будущих записей для удаления.');
             button(footer, 'Отмена', close);
             if (plan.operations.length) button(footer, 'Подтвердить очистку всех складов', commitClear, 'danger');
@@ -1650,24 +1755,49 @@
             }
         }
 
+        function renderNavigation() {
+            steps.replaceChildren();
+            steps.hidden = ['choose', 'loading', 'load-error'].includes(state.phase);
+            if (steps.hidden) return;
+            const stages = state.mode === 'new'
+                ? ['Параметры', 'Шаблон дня', 'Неделя', 'Сохранение']
+                : state.mode === 'clear' ? ['Проверка записей', 'Очистка'] : ['Даты', 'Проверка копии', 'Сохранение'];
+            const current = state.mode === 'clear' ? (state.phase === 'clear-confirm' ? 0 : 1)
+                : state.phase === 'setup' ? 0 : state.phase === 'template' ? 1 : state.phase === 'review' ? (state.mode === 'new' ? 2 : 1) : stages.length - 1;
+            stages.forEach((label, index) => {
+                const item = scheduleElement('span', null, `adeo-schedule-step${index === current ? ' current' : index < current ? ' done' : ''}`);
+                item.append(scheduleElement('b', String(index + 1)), scheduleElement('span', label));
+                if (index === current) item.setAttribute('aria-current', 'step'); steps.append(item);
+            });
+        }
+
         function render() {
+            const previousPhase = modal.dataset.phase;
+            modal.dataset.phase = state.phase; modal.dataset.mode = state.mode; modal.dataset.view = '';
+            renderNavigation();
             content.replaceChildren(); footer.replaceChildren(); errorBox.textContent = state.error; content.append(errorBox);
             if (state.phase === 'loading') { note(content, 'Загружаем расписание и склады выбранного поставщика…'); return; }
             if (state.phase === 'load-error') { note(content, 'Не удалось загрузить данные CRM. Закройте мастер и попробуйте снова.'); return; }
             if (state.phase === 'choose') {
                 note(content, 'Выберите действие для текущего поставщика.'); const modes = scheduleElement('div', null, 'adeo-schedule-mode');
                 for (const [mode, title, description] of [['copy', 'Скопировать день', 'Перенести все еженедельные записи конкретного дня на другую дату.'], ['new', 'Заполнить с нуля', 'Выбрать дни, заполнить один день и подготовить всю неделю.']]) {
-                    const node = button(modes, title, () => { state.mode = mode; state.phase = 'setup'; render(); }, 'primary'); node.append(scheduleElement('small', description));
+                    const node = button(modes, title, () => { state.mode = mode; state.phase = 'setup'; render(); });
+                    const icon = scheduleElement('span', mode === 'copy' ? '↪' : '＋', 'adeo-schedule-mode-icon'); icon.setAttribute('aria-hidden', 'true');
+                    node.replaceChildren(icon, scheduleElement('strong', title), scheduleElement('small', description));
                 }
                 content.append(modes);
-                button(content, 'Очистить всё расписание', prepareClear, 'danger'); return;
+                const dangerZone = scheduleElement('div', null, 'adeo-schedule-danger-zone');
+                note(dangerZone, 'Нужно удалить будущие отправки? Очистка доступна отдельно и требует подтверждения.');
+                button(dangerZone, 'Очистить всё расписание', prepareClear, 'danger'); content.append(dangerZone); return;
             }
             if (state.phase === 'setup') { button(footer, 'Назад', () => { state.phase = 'choose'; render(); }); renderSetup(); }
             else if (state.phase === 'template') {
                 content.append(scheduleElement('h3', 'Заполните один день отправок'));
-                note(content, 'Добавьте любое количество записей. Срок считается в календарных днях, затем доставка переносится на ближайший разрешённый день. Время для короткой субботы проверим отдельно.');
+                note(content, 'Каждая строка — одна отправка. Срок считается в календарных днях; выходные доставки учтём при заполнении недели.');
+                const toolbar = scheduleElement('div', null, 'adeo-schedule-toolbar');
+                toolbar.append(scheduleElement('strong', `Записей в шаблоне: ${state.template.length}`));
+                button(toolbar, '＋ Добавить запись', () => { state.template.push(freshTemplate()); state.dirty = true; render(); }); content.append(toolbar);
                 const rows = scheduleElement('div', null, 'adeo-schedule-template'); state.template.forEach(row => renderRow(rows, row, state.template, true)); content.append(rows);
-                button(content, '＋ Добавить запись', () => { state.template.push(freshTemplate()); state.dirty = true; render(); });
                 button(footer, 'Назад', () => { state.phase = 'setup'; render(); });
                 button(footer, 'Заполнить выбранные дни', () => {
                     if (state.groups.length && !window.confirm('Сформировать неделю заново? Индивидуальные правки дней будут заменены шаблоном.')) return;
@@ -1678,6 +1808,7 @@
             else if (state.phase === 'confirm') renderConfirm();
             else if (state.phase === 'clear-confirm') renderClearConfirm();
             else renderJob();
+            if (previousPhase !== state.phase) { content.scrollTop = 0; content.scrollLeft = 0; }
         }
         render();
         try {

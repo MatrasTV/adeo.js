@@ -1,9 +1,31 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { resolve } = require('node:path');
+const { mkdirSync, readFileSync } = require('node:fs');
 
 let chromium;
 try { ({ chromium } = require('playwright')); } catch { /* Браузерные проверки доступны при установленном Playwright. */ }
+
+async function captureLayout(page, name) {
+    if (!process.env.ADEO_UI_SCREENSHOT_DIR) return;
+    mkdirSync(process.env.ADEO_UI_SCREENSHOT_DIR, { recursive: true });
+    await page.locator('.adeo-schedule-modal').screenshot({ path: resolve(process.env.ADEO_UI_SCREENSHOT_DIR, `${name}.png`) });
+}
+
+async function assertDialogFits(page) {
+    const dimensions = await page.locator('.adeo-schedule-modal').evaluate(modal => {
+        const bounds = modal.getBoundingClientRect();
+        return { left: bounds.left, right: bounds.right, top: bounds.top, bottom: bounds.bottom,
+            width: innerWidth, height: innerHeight, headingSizes: [...modal.querySelectorAll('h3')].map(node => parseFloat(getComputedStyle(node).fontSize)) };
+    });
+    assert.ok(dimensions.left >= 0 && dimensions.right <= dimensions.width, 'Окно должно помещаться по ширине экрана');
+    assert.ok(dimensions.top >= 0 && dimensions.bottom <= dimensions.height, 'Окно должно помещаться по высоте экрана');
+    assert.ok(dimensions.headingSizes.every(size => size <= 24), 'Глобальный стиль CRM не должен увеличивать заголовки мастера');
+    const footer = page.locator('.adeo-schedule-footer');
+    if (await footer.isVisible()) {
+        for (const control of await footer.locator('button').all()) assert.ok(await control.isVisible(), 'Основные действия должны быть видны');
+    }
+}
 
 async function fixture(path = '/supplier/supplier-list') {
     const browser = await chromium.launch({ channel: 'chrome', headless: true });
@@ -13,7 +35,7 @@ async function fixture(path = '/supplier/supplier-list') {
     page.on('dialog', dialog => dialog.accept());
     // Все обращения к домену подменены локальной страницей; настоящая CRM в тесте недоступна.
     await page.route('https://crm.adeo.pro/**', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body:
-        '<html lang="ru"><head><meta charset="UTF-8"></head><body><div id="q-app"><div class="q-dialog__inner"><main class="work-calendar"><div class="row">Отправка заказов CellaTEST</div></main></div></div></body></html>' }));
+        '<html lang="ru"><head><meta charset="UTF-8"><style>body{font:14px Arial;margin:20px;background:#eef1f5}h3{font-size:48px;line-height:1.2;font-weight:400;margin:40px 0}button,input,select{font-family:serif}summary{display:block}td{padding:20px}</style></head><body><div id="q-app"><div class="q-dialog__inner"><main class="work-calendar"><div class="row">Отправка заказов CellaTEST</div></main></div></div></body></html>' }));
     await page.goto(`https://crm.adeo.pro${path}`);
     const dates = await page.evaluate(() => {
         const day = date => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
@@ -193,11 +215,11 @@ test('Копирование дня в черновике спрашивает �
         await friday.getByRole('button', { name: 'На следующий день', exact: true }).click();
         await page.getByRole('button', { name: 'Заменить', exact: true }).click();
         assert.equal(await saturday.locator('.adeo-schedule-row').count(), 1);
-        await friday.locator('summary').click();
+        await friday.locator('.adeo-schedule-row > summary').click();
         await friday.getByLabel('Отправка заказа', { exact: true }).fill('10:00');
-        await friday.locator('summary').click();
-        assert.match(await saturday.locator('summary').textContent(), /^09:00/);
-        assert.match(await friday.locator('summary').textContent(), /^10:00/);
+        await friday.locator('.adeo-schedule-row > summary').click();
+        assert.match(await saturday.locator('.adeo-schedule-row > summary').textContent(), /^09:00/);
+        assert.match(await friday.locator('.adeo-schedule-row > summary').textContent(), /^10:00/);
         await friday.getByRole('button', { name: 'На следующий день', exact: true }).click();
         await page.getByRole('button', { name: 'Добавить', exact: true }).click();
         assert.equal(await saturday.locator('.adeo-schedule-row').count(), 2);
@@ -298,6 +320,7 @@ test('Очистка требует подтверждения, удаляет �
         await seedClear(page, dates);
         await page.getByRole('button', { name: 'Очистить всё расписание', exact: true }).click();
         await page.getByRole('heading', { name: 'Очистка всего будущего расписания', exact: true }).waitFor();
+        await assertDialogFits(page); await captureLayout(page, '11-clear');
         assert.match(await page.locator('.adeo-schedule-summary').textContent(), /Еженедельных правил: 2.*Разовых записей: 1.*отправок.*4/);
         assert.equal(await page.evaluate(() => window.mutations.length), 0);
         await page.getByRole('button', { name: 'Отмена', exact: true }).click();
@@ -359,6 +382,152 @@ test('Очистка не сообщает об успехе, если CRM пр�
         assert.match(await page.getByRole('alert').textContent(), /Очистка не подтверждена полностью/);
         assert.equal(await page.getByRole('heading', { name: 'Будущее расписание очищено', exact: true }).count(), 0);
         assert.equal(await page.evaluate(() => window.refreshed), 0);
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
+test('Вёрстка мастера изолирована от CRM, шаблон компактен, а ошибки ведут к нужной записи', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 60000
+}, async () => {
+    const { browser, page, errors } = await fixture();
+    try {
+        await page.setViewportSize({ width: 1920, height: 1080 });
+        await page.getByRole('button', { name: 'Мастер расписания', exact: true }).click();
+        await page.getByRole('button', { name: 'Заполнить с нуля' }).waitFor();
+        assert.ok((await page.locator('.adeo-schedule-modal').boundingBox()).width < 1100);
+        await assertDialogFits(page); await captureLayout(page, '01-actions');
+        await page.getByRole('button', { name: 'Заполнить с нуля' }).click();
+        await assertDialogFits(page); await captureLayout(page, '02-settings');
+        await page.getByRole('button', { name: 'Далее: заполнить день', exact: true }).click();
+        for (let index = 1; index < 5; index++) await page.getByRole('button', { name: '＋ Добавить запись', exact: true }).click();
+        const rows = page.locator('.adeo-schedule-template .adeo-schedule-row');
+        for (let index = 0; index < 5; index++) await rows.nth(index).getByLabel('Отправка заказа', { exact: true }).fill(`${String(index + 7).padStart(2, '0')}:00`);
+        const first = await rows.first().boundingBox(), second = await rows.nth(1).boundingBox();
+        assert.ok(first.height < 130 && second.y >= first.y + first.height, 'Шаблон должен состоять из компактных неперекрывающихся строк');
+        await assertDialogFits(page); await captureLayout(page, '03-template');
+        await page.getByRole('button', { name: 'Заполнить выбранные дни', exact: true }).click();
+        await assertDialogFits(page); await captureLayout(page, '04-week');
+        await page.getByRole('button', { name: 'Назад', exact: true }).click();
+        await page.locator('.adeo-schedule-template .adeo-schedule-row').first().getByRole('button', { name: 'Копия', exact: true }).click();
+        await page.getByRole('button', { name: 'Заполнить выбранные дни', exact: true }).click();
+        assert.equal(await page.locator('.adeo-schedule-row-invalid').count(), 10);
+        await page.getByRole('button', { name: 'Сохранить всё', exact: true }).click();
+        assert.match(await page.getByRole('alert').textContent(), /исправьте замечания: 5/);
+        await captureLayout(page, '05-week-errors');
+        await page.getByRole('button', { name: 'К первой ошибке', exact: true }).click();
+        assert.equal(await page.locator('.adeo-schedule-row-invalid[open]').count(), 1);
+        assert.equal(await page.evaluate(() => document.activeElement?.getAttribute('aria-label')), 'Отправка заказа');
+        await page.setViewportSize({ width: 1366, height: 768 }); await assertDialogFits(page);
+        assert.equal(await page.locator('.adeo-schedule-grid').evaluate(node => node.scrollWidth <= node.clientWidth + 1), true, 'На ноутбуке должны помещаться все семь дней без обрезания воскресенья');
+        await captureLayout(page, '06-week-laptop');
+        await page.getByRole('button', { name: 'Закрыть мастер', exact: true }).click();
+        await page.getByRole('button', { name: 'Мастер расписания', exact: true }).click();
+        await page.getByRole('button', { name: 'Заполнить с нуля' }).click();
+        await page.setViewportSize({ width: 390, height: 844 }); await assertDialogFits(page); await captureLayout(page, '12-settings-mobile');
+        await page.getByRole('button', { name: 'Далее: заполнить день', exact: true }).click();
+        await assertDialogFits(page); await captureLayout(page, '13-template-mobile');
+        const inputBounds = await page.getByLabel('Отправка заказа', { exact: true }).boundingBox();
+        const modalBounds = await page.locator('.adeo-schedule-modal').boundingBox();
+        assert.ok(inputBounds.x >= modalBounds.x && inputBounds.x + inputBounds.width <= modalBounds.x + modalBounds.width, 'Поле времени не должно выходить за край мобильного окна');
+        assert.equal(await page.evaluate(() => window.mutations.length), 0);
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
+test('Копия использует ширину окна, а свёрнутая история не блокирует замену', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 60000
+}, async () => {
+    const { browser, page, dates, errors } = await fixture();
+    try {
+        await page.setViewportSize({ width: 1920, height: 1080 });
+        await seedCopy(page, dates);
+        const widths = await page.evaluate(() => ({ modal: document.querySelector('.adeo-schedule-modal').getBoundingClientRect().width,
+            content: document.querySelector('.adeo-schedule-content').clientWidth, grid: document.querySelector('.adeo-schedule-grid').getBoundingClientRect().width }));
+        assert.ok(widths.modal < 1100 && widths.grid > widths.content * 0.85, 'Одна копируемая дата не должна оставлять пустую половину широкого окна');
+        await assertDialogFits(page); await captureLayout(page, '07-copy');
+        await page.evaluate(date => {
+            const old = new Date(`${date}T12:00:00+03:00`); old.setDate(old.getDate() - 1001);
+            const day = `${old.getFullYear()}-${String(old.getMonth() + 1).padStart(2, '0')}-${String(old.getDate()).padStart(2, '0')}`;
+            for (let index = 0; index < 3; index++) window.events.push({ id: 90 + index, weeklyScheduleId: 900 + index, supplierId: 127, nfile: 7,
+                ordersAcceptedAt: `${day}T0${index + 6}:00:00+03:00`, orderDeliveryIntervalStart: null, orderDeliveryIntervalEnd: null });
+        }, dates.target);
+        await page.getByRole('button', { name: 'Сохранить всё', exact: true }).click();
+        await page.getByRole('button', { name: 'Подтвердить сохранение', exact: true }).waitFor();
+        assert.equal(await page.locator('.adeo-schedule-history').evaluate(node => node.open), false);
+        assert.match(await page.locator('.adeo-schedule-table th').first().evaluate(node => getComputedStyle(node).fontFamily), /Arial/i);
+        assert.equal(await page.getByLabel('Действие', { exact: true }).locator('option[value="replace"]').evaluate(node => node.disabled), false);
+        assert.equal(await page.getByRole('button', { name: 'Везде заменить', exact: true }).isEnabled(), true);
+        await assertDialogFits(page); await captureLayout(page, '08-conflicts');
+        await page.setViewportSize({ width: 1366, height: 768 }); await assertDialogFits(page); await captureLayout(page, '09-conflicts-laptop');
+        await page.setViewportSize({ width: 390, height: 844 }); await assertDialogFits(page); await captureLayout(page, '10-conflicts-mobile');
+        assert.equal(await page.evaluate(() => window.mutations.length), 0);
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
+test('Ответ CRM с десятью историческими правилами позволяет заменить только будущие записи', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 45000
+}, async () => {
+    const { browser, page, errors } = await fixture();
+    try {
+        const records = JSON.parse(readFileSync(resolve(__dirname, 'fixtures/crm-schedule-history.json'), 'utf8'));
+        const seeded = await page.evaluate(records => {
+            const day = date => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+            const monday = new Date(); monday.setDate(monday.getDate() + 1);
+            while (monday.getDay() !== 1) monday.setDate(monday.getDate() + 1);
+            const target = day(monday);
+            const offset = Math.round((Date.parse(`${target}T12:00:00Z`) - Date.parse('2026-11-02T12:00:00Z')) / 86400000);
+            const shift = value => {
+                if (!value) return value;
+                const date = new Date(`${value.slice(0, 10)}T12:00:00Z`); date.setUTCDate(date.getUTCDate() + offset);
+                return date.toISOString().slice(0, 10) + value.slice(10);
+            };
+            window.events = records.map(event => ({ ...event, ordersAcceptedAt: shift(event.ordersAcceptedAt),
+                orderDeliveryIntervalStart: shift(event.orderDeliveryIntervalStart), orderDeliveryIntervalEnd: shift(event.orderDeliveryIntervalEnd) }));
+            window.calendarProxy.supplier.id = 11;
+            return { target, pastIds: window.events.filter(event => event.ordersAcceptedAt.slice(0, 10) < target).map(event => event.id) };
+        }, records);
+        await page.getByRole('button', { name: 'Мастер расписания', exact: true }).click();
+        await page.getByRole('button', { name: 'Заполнить с нуля' }).click();
+        await page.getByLabel('Начать с', { exact: true }).fill(seeded.target);
+        const orderDays = page.locator('.adeo-schedule-box').filter({ hasText: '2. Когда отправлять' });
+        for (const name of ['Вторник', 'Среда', 'Четверг', 'Пятница']) await orderDays.getByLabel(name, { exact: true }).uncheck();
+        await page.getByRole('button', { name: 'Далее: заполнить день', exact: true }).click();
+        await page.getByRole('button', { name: 'Заполнить выбранные дни', exact: true }).click();
+        await page.getByRole('button', { name: 'Сохранить всё', exact: true }).click();
+        await page.getByRole('button', { name: 'Подтвердить сохранение', exact: true }).waitFor();
+        assert.match(await page.locator('.adeo-schedule-conflict').textContent(), /Существующих правил: 6/);
+        assert.match(await page.locator('.adeo-schedule-history summary').textContent(), /10 правил/);
+        assert.equal(await page.getByLabel('Действие', { exact: true }).locator('option[value="replace"]').evaluate(node => node.disabled), false);
+        await page.getByRole('button', { name: 'Везде заменить', exact: true }).click();
+        assert.equal(await page.evaluate(() => window.mutations.length), 0);
+        await page.getByRole('button', { name: 'Подтвердить сохранение', exact: true }).click();
+        await page.getByRole('heading', { name: 'Расписание сохранено', exact: true }).waitFor();
+        const result = await page.evaluate(() => ({ operations: window.mutations, remainingIds: window.events.map(event => event.id) }));
+        const removals = result.operations.filter(operation => operation.type === 'remove');
+        assert.equal(removals.length, 6);
+        assert.equal(result.operations.filter(operation => operation.type === 'create').length, 1);
+        assert.ok(removals.every(operation => operation.future && !seeded.pastIds.includes(operation.id)));
+        assert.ok(seeded.pastIds.every(id => result.remainingIds.includes(id)));
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
+test('Замена остаётся недоступной за пределами загруженных дат действующего повтора', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 45000
+}, async () => {
+    const { browser, page, dates, errors } = await fixture();
+    try {
+        await seedCopy(page, dates);
+        await page.getByRole('button', { name: 'Назад', exact: true }).click();
+        const later = new Date(`${dates.target}T12:00:00Z`); later.setUTCDate(later.getUTCDate() + 70);
+        await page.getByLabel('В какой день', { exact: true }).fill(later.toISOString().slice(0, 10));
+        await page.getByRole('button', { name: 'Подготовить копию', exact: true }).click();
+        await page.getByRole('button', { name: 'Сохранить всё', exact: true }).click();
+        await page.getByRole('button', { name: 'Подтвердить сохранение', exact: true }).waitFor();
+        assert.equal(await page.getByLabel('Действие', { exact: true }).locator('option[value="replace"]').evaluate(node => node.disabled), true);
+        assert.match(await page.locator('.adeo-schedule-warning').textContent(), /действующих правил/);
+        assert.equal(await page.evaluate(() => window.mutations.length), 0);
         assert.deepEqual(errors, []);
     } finally { await browser.close(); }
 });
