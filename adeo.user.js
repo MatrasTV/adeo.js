@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ADEO — прайсы и расписание поставщиков
 // @namespace    admin.adeo.pro
-// @version      3.4.0
-// @description  Работа с прайсами и мастер еженедельного расписания поставщиков CRM
+// @version      3.4.1
+// @description  Работа с прайсами и мастер расписания поставщиков CRM
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
 // @homepageURL  https://github.com/MatrasTV/adeo.js
@@ -954,7 +954,9 @@
             for (const event of events) {
                 if (!group.nfiles.some(value => scheduleScopesOverlap(value, event.nfile))) continue;
                 const day = scheduleDay(event.ordersAcceptedAt);
-                if (isWeeklySchedule(event) && scheduleWeekday(day) === scheduleWeekday(group.date)) {
+                if (group.repeatWeekly === false) {
+                    if (day === group.date) once.push(event);
+                } else if (isWeeklySchedule(event) && scheduleWeekday(day) === scheduleWeekday(group.date)) {
                     const key = String(event.weeklyScheduleId);
                     if (!series.has(key)) series.set(key, []);
                     series.get(key).push(event);
@@ -1011,12 +1013,13 @@
                 }
             }
             for (const draft of group.entries) {
-                const payload = scheduleDraftPayload(draft, supplierId);
+                const payload = { ...scheduleDraftPayload(draft, supplierId), repeatWeekly: group.repeatWeekly !== false };
                 if (decision === 'add') {
                     const sameWeeklySlot = weekly.filter(series => series.instances.some(event =>
                         scheduleScopesOverlap(event.nfile, draft.nfile) && scheduleTime(event.ordersAcceptedAt) === draft.sendTime));
-                    const identical = sameWeeklySlot.some(series => series.first && series.instances.some(event =>
-                        scheduleDay(event.ordersAcceptedAt) <= group.date && scheduleRepeatSignature(event) === scheduleRepeatSignature(payload)));
+                    const identical = payload.repeatWeekly ? sameWeeklySlot.some(series => series.first && series.instances.some(event =>
+                        scheduleDay(event.ordersAcceptedAt) <= group.date && scheduleRepeatSignature(event) === scheduleRepeatSignature(payload)))
+                        : once.some(event => scheduleRecordSignature(event) === scheduleRecordSignature(payload));
                     if (identical) { skipped++; continue; }
                     if (sameWeeklySlot.length || once.some(event => scheduleScopesOverlap(event.nfile, draft.nfile) && scheduleTime(event.ordersAcceptedAt) === draft.sendTime)) {
                         throw new Error(`${group.date}, ${draft.sendTime}: в пересекающемся расписании уже существует отправка для этих складов. Выберите «Заменить», если замена доступна, или другое время.`);
@@ -1050,6 +1053,12 @@
         ].sort((a, b) => new Date(a.event.ordersAcceptedAt) - new Date(b.event.ordersAcceptedAt));
         return { operations, skipped: 0, index: 0, created: 0, deleted: 0, uncertain: false, error: '',
             clearing: true, supplierId, ruleCount: weekly.size, onceCount: once.size, futureCount };
+    }
+
+    // Проверяем конкретную дату: наличие еженедельного правила не гарантирует отправку в праздник.
+    function missingScheduleCopies(events, drafts, supplierId) {
+        const existing = new Set(events.map(scheduleRecordSignature));
+        return drafts.filter(draft => !existing.has(scheduleRecordSignature(scheduleDraftPayload(draft, supplierId))));
     }
 
     // Используем тот же объект $API, что и штатный CalendarEventEditor; адреса и авторизацию не дублируем.
@@ -1095,7 +1104,8 @@
             try { return [JSON.stringify(value)]; } catch { return []; }
         }
         try { responseText = [...new Set(messages(data))].join('\n').slice(0, 3000); } catch { /* Сохраняем основное сообщение, даже если формат ответа неизвестен. */ }
-        const subject = operation?.type === 'remove' ? 'удалении записи расписания' : 'создании еженедельной записи';
+        const subject = operation?.type === 'remove' ? 'удалении записи расписания'
+            : operation?.payload?.repeatWeekly === false ? 'создании одноразовой записи' : 'создании еженедельной записи';
         const lines = [status ? `CRM вернула HTTP ${status} при ${subject}.` : `Ошибка при ${subject}.`];
         const entry = operation?.payload || operation?.event;
         if (entry) {
@@ -1135,7 +1145,7 @@
         const events = await adapter.list(supplierId);
         const operation = job.operations[job.index];
         const complete = operation.type === 'create'
-            ? events.some(event => isWeeklySchedule(event) && scheduleRecordSignature(event) === scheduleRecordSignature(operation.payload))
+            ? events.some(event => isWeeklySchedule(event) === (operation.payload.repeatWeekly !== false) && scheduleRecordSignature(event) === scheduleRecordSignature(operation.payload))
             : !events.some(event => operation.future
                 ? String(event.weeklyScheduleId) === String(operation.event.weeklyScheduleId) && scheduleDay(event.ordersAcceptedAt) >= operation.boundary
                 : String(event.id) === String(operation.event.id));
@@ -1246,7 +1256,7 @@
         const supplierId = proxy.supplier.id;
         const state = {
             phase: 'loading', mode: initialMode === 'clear' ? 'clear' : '', startDate: addScheduleDays(scheduleDay(), 1), sourceDate: addScheduleDays(scheduleDay(), 1),
-            targetDate: addScheduleDays(scheduleDay(), 2), nfile: null, storages: [], orderDays: [0, 1, 2, 3, 4], deliveryDays: [0, 1, 2, 3, 4],
+            targetDate: addScheduleDays(scheduleDay(), 2), repeatWeekly: true, nfile: null, storages: [], orderDays: [0, 1, 2, 3, 4], deliveryDays: [0, 1, 2, 3, 4],
             template: [{ uid: String(++scheduleDraftSequence), sendTime: '09:00', leadDays: 1, deliveryHour: 15, haveDelivery: true }],
             groups: [], events: [], decisions: {}, snapshot: '', dirty: false, busy: false, error: '', job: null
         };
@@ -1449,6 +1459,11 @@
             box.append(tools); parent.append(box);
         }
         function renderSetup() {
+            select(content, 'Все новые записи', state.repeatWeekly ? 'weekly' : 'once', [
+                { value: 'once', label: 'Одноразовые' },
+                { value: 'weekly', label: 'С еженедельным повторением' }
+            ], value => { state.repeatWeekly = value === 'weekly'; });
+            note(content, 'Выбранный тип применяется ко всем новым записям. Для праздничного дня выберите одноразовые.');
             if (state.mode === 'new') {
                 const box = scheduleElement('div', null, 'adeo-schedule-box'); box.append(scheduleElement('h3', '1. Склад и дата начала'));
                 const fields = scheduleElement('div', null, 'adeo-schedule-form-pair');
@@ -1485,7 +1500,7 @@
                         if (!source.length) throw new Error('CRM не вернула еженедельных записей для этого дня. Выберите день с загруженным расписанием.');
                         const offset = (parseScheduleDay(state.targetDate) - parseScheduleDay(state.sourceDate)) / 86400000;
                         const entries = source.map(event => scheduleEventToDraft(event, offset));
-                        state.events = events; state.groups = [{ date: state.targetDate, weekday: scheduleWeekday(state.targetDate), enabled: true,
+                        state.events = events; state.groups = [{ date: state.targetDate, weekday: scheduleWeekday(state.targetDate), enabled: true, repeatWeekly: state.repeatWeekly,
                             nfiles: [...new Map(entries.map(row => [scheduleNfile(row.nfile), row.nfile])).values()], entries }];
                         state.dirty = true; state.phase = 'review';
                     } finally { setBusy(false); render(); }
@@ -1512,6 +1527,7 @@
         }
 
         function renderReview() {
+            note(content, state.repeatWeekly ? 'Все новые записи: с еженедельным повторением.' : 'Все новые записи: одноразовые.');
             note(content, state.mode === 'copy' ? 'Проверьте копию перед сохранением. Нажмите на запись, чтобы изменить время или доставку.' : 'У каждого дня указана первая дата отправки. Раскройте запись для редактирования; изменения сохранятся после общей проверки.');
             if (state.mode === 'copy') {
                 const settings = scheduleElement('details', null, 'adeo-schedule-settings');
@@ -1612,9 +1628,13 @@
         function renderConfirm() {
             const conflicts = findScheduleConflicts(state.events, state.groups).filter(item => item.count);
             content.append(scheduleElement('h3', 'Проверка перед сохранением'));
-            note(content, 'Новые записи будут повторяться еженедельно. «Заменить» прекращает показанные прежние повторы с указанной будущей даты и удаляет разовые записи этой даты в затронутых складах. Прошедшие даты сохраняются.');
+            note(content, state.repeatWeekly
+                ? 'Все новые записи будут повторяться еженедельно. «Заменить» прекращает показанные прежние повторы с указанной будущей даты и удаляет разовые записи этой даты в затронутых складах. Прошедшие даты сохраняются.'
+                : 'Все новые записи одноразовые, только на указанные даты. «Заменить» удаляет только показанные отправки этих дат; еженедельные повторы на другие даты сохраняются.');
             if (state.groups.some(group => group.enabled && group.nfiles.some(value => scheduleNfile(value) === ''))) {
-                note(content, 'Выбраны все склады: замена включает правила отдельных складов выбранных дней недели. Проверьте их список перед подтверждением.');
+                note(content, state.repeatWeekly
+                    ? 'Выбраны все склады: замена включает правила отдельных складов выбранных дней недели. Проверьте их список перед подтверждением.'
+                    : 'Выбраны все склады: замена включает отправки отдельных складов только на выбранные даты. Проверьте их список перед подтверждением.');
             }
             if (!conflicts.length) note(content, 'Существующих записей в выбранных днях и складах не найдено. Можно сохранить подготовленное расписание.');
             else {
@@ -1634,7 +1654,8 @@
                     select(top, 'Действие', state.decisions[conflict.group.date] || '', [
                         { value: '', label: 'Выберите действие' }, { value: 'add', label: 'Добавить' }, { value: 'replace', label: 'Заменить', disabled: !canReplace(conflict) }, { value: 'skip', label: 'Пропустить день' }
                     ], value => { state.decisions[conflict.group.date] = value; }); box.append(top);
-                    const active = [...conflict.weekly.filter(series => series.first).map(series => ({ event: series.first, label: 'Еженедельно' })), ...conflict.once.map(event => ({ event, label: 'Разовая' }))];
+                    const active = [...conflict.weekly.filter(series => series.first).map(series => ({ event: series.first, label: 'Еженедельно' })),
+                        ...conflict.once.map(event => ({ event, label: isWeeklySchedule(event) ? 'Еженедельная · только эта дата' : 'Разовая' }))];
                     if (active.length) {
                         const details = scheduleElement('details', null, 'adeo-schedule-conflict-details'); details.open = conflicts.length === 1;
                         details.append(scheduleElement('summary', `Будущие записи · ${active.length}`)); scheduleTable(details, active); box.append(details);
@@ -1701,6 +1722,8 @@
         async function commitSave() {
             assertContext();
             const job = makeSchedulePlan(state.events, state.groups, state.decisions, supplierId, state.deliveryDays);
+            if (state.mode === 'copy') job.copyDrafts = state.groups.filter(group => group.enabled && state.decisions[group.date] !== 'skip')
+                .flatMap(group => group.entries.map(draft => ({ ...draft })));
             setBusy(true);
             try {
                 const latest = await adapter.list(supplierId);
@@ -1722,6 +1745,13 @@
                         throw new Error('После очистки CRM всё ещё возвращает будущие записи. Очистка не подтверждена полностью. Проверьте результат; новые или оставшиеся записи автоматически не удаляются.');
                     }
                 }
+                if (state.job.copyDrafts) {
+                    const events = await adapter.list(supplierId);
+                    const missing = missingScheduleCopies(events, state.job.copyDrafts, supplierId);
+                    if (missing.length) throw new Error(state.repeatWeekly
+                        ? 'CRM не вернула часть копий на выбранную дату. Еженедельные записи могут пропускать праздники. Проверьте календарь; для праздничной даты выберите одноразовые записи в начале мастера.'
+                        : 'CRM не подтвердила появление части одноразовых копий на выбранную дату. Обновите календарь и проверьте результат.');
+                }
                 state.phase = 'done'; state.dirty = false;
                 try { await proxy.loadSchedules(); } catch { state.error = 'Изменения выполнены, но календарь не обновился. Нажмите штатную кнопку обновления календаря.'; }
             } catch (error) { state.phase = 'failed'; state.error = error?.message || 'Не удалось завершить сохранение.'; }
@@ -1741,7 +1771,7 @@
             content.append(scheduleElement('h3', title));
             const label = scheduleElement('p'); label.dataset.scheduleProgressLabel = ''; label.setAttribute('role', 'status'); label.setAttribute('aria-live', 'polite'); content.append(label);
             const progress = scheduleElement('progress', null, 'adeo-schedule-progress'); progress.max = job.operations.length || 1; progress.value = job.index; content.append(progress); renderProgress();
-            if (job.skipped) note(content, `Одинаковых еженедельных правил уже было в CRM: ${job.skipped}. Повторно они не создавались.`);
+            if (job.skipped) note(content, `Одинаковых записей уже было в CRM: ${job.skipped}. Повторно они не создавались.`);
             if (state.phase === 'done') button(footer, 'Закрыть', close, 'primary');
             if (state.phase === 'failed') {
                 note(content, 'Уже выполненные изменения сохранены в CRM. Повторная отправка неподтверждённого запроса автоматически не выполняется, чтобы не создавать дубли.');
@@ -1801,7 +1831,8 @@
                 button(footer, 'Назад', () => { state.phase = 'setup'; render(); });
                 button(footer, 'Заполнить выбранные дни', () => {
                     if (state.groups.length && !window.confirm('Сформировать неделю заново? Индивидуальные правки дней будут заменены шаблоном.')) return;
-                    state.groups = buildScheduleWeek(state.template, state.orderDays, state.deliveryDays, state.startDate, state.nfile);
+                    state.groups = buildScheduleWeek(state.template, state.orderDays, state.deliveryDays, state.startDate, state.nfile)
+                        .map(group => ({ ...group, repeatWeekly: state.repeatWeekly }));
                     state.dirty = true; state.phase = 'review'; render();
                 }, 'primary');
             } else if (state.phase === 'review') renderReview();

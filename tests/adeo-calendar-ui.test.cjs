@@ -46,7 +46,9 @@ async function fixture(path = '/supplier/supplier-list') {
             async list() { return { data: JSON.parse(JSON.stringify(window.events)) }; },
             async create(payload) {
                 window.mutations.push({ type: 'create', payload: { ...payload } });
-                window.events.push({ ...payload, id: 1000 + window.mutations.length, weeklyScheduleId: 2000 + window.mutations.length });
+                if (window.rejectHoliday && payload.repeatWeekly) throw { response: { status: 417, data: { message: 'Праздничный день' } } };
+                const stored = { ...payload };
+                window.events.push({ ...stored, id: 1000 + window.mutations.length, weeklyScheduleId: payload.repeatWeekly ? 2000 + window.mutations.length : 0 });
                 if (window.failNextCreate) { window.failNextCreate = false; throw new Error('Ответ сервера потерян'); }
                 return { data: { id: 1000 + window.mutations.length } };
             },
@@ -120,7 +122,7 @@ test('Мастер заполняет 20 записей, исправляет с
     } finally { await browser.close(); }
 });
 
-async function seedCopy(page, dates) {
+async function seedCopy(page, dates, repeat = 'weekly') {
     await page.evaluate(({ source, target }) => {
         const entry = (id, date, time, nfile, weekly = true) => ({ id, supplierId: 127, nfile,
             weeklyScheduleId: weekly ? id + 100 : 0, ordersAcceptedAt: `${date}T${time}:00+03:00`,
@@ -130,6 +132,7 @@ async function seedCopy(page, dates) {
     }, dates);
     await page.getByRole('button', { name: 'Мастер расписания', exact: true }).click();
     await page.getByRole('button', { name: 'Скопировать день' }).click();
+    await page.getByLabel('Все новые записи', { exact: true }).selectOption(repeat);
     await page.getByLabel('Из какого дня', { exact: true }).fill(dates.source);
     await page.getByLabel('В какой день', { exact: true }).fill(dates.target);
     await page.getByRole('button', { name: 'Подготовить копию', exact: true }).click();
@@ -156,6 +159,67 @@ test('Копирование берёт только еженедельные з
         assert.ok(created.every(item => item.ordersAcceptedAt.startsWith(dates.target) && item.repeatWeekly && item.orderDeliveryIntervalStart === null));
         assert.ok([1, 2, 3].every(id => data.events.some(event => event.id === id)));
         assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
+test('Тип выбирается до копирования: все копии праздничного дня одноразовые', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 45000
+}, async () => {
+    const { browser, page, dates, errors } = await fixture();
+    try {
+        await seedCopy(page, dates, 'once');
+        await page.evaluate(() => { window.rejectHoliday = true; });
+        await page.getByRole('button', { name: 'Сохранить всё', exact: true }).click();
+        assert.match(await page.locator('.adeo-schedule-content').textContent(), /Все новые записи одноразовые/);
+        await page.getByRole('button', { name: 'Везде заменить', exact: true }).click();
+        assert.equal(await page.evaluate(() => window.mutations.length), 0);
+        await page.getByRole('button', { name: 'Подтвердить сохранение', exact: true }).click();
+        await page.getByRole('heading', { name: 'Расписание сохранено', exact: true }).waitFor();
+        const mutations = await page.evaluate(() => window.mutations);
+        const created = mutations.filter(item => item.type === 'create');
+        assert.equal(created.length, 2);
+        assert.ok(created.every(item => item.payload.repeatWeekly === false && item.payload.ordersAcceptedAt.startsWith(dates.target)));
+        assert.deepEqual(created.map(item => item.payload.nfile), [7, null]);
+        assert.ok(mutations.filter(item => item.type === 'remove').every(item => item.future === false));
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
+test('Одноразовый тип применяется ко всем записям заполнения с нуля', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 45000
+}, async () => {
+    const { browser, page, dates, errors } = await fixture();
+    try {
+        await page.getByRole('button', { name: 'Мастер расписания', exact: true }).click();
+        await page.getByRole('button', { name: 'Заполнить с нуля' }).click();
+        await page.getByLabel('Все новые записи', { exact: true }).selectOption('once');
+        await page.getByLabel('Начать с', { exact: true }).fill(dates.source);
+        await page.getByRole('button', { name: 'Далее: заполнить день', exact: true }).click();
+        await page.getByRole('button', { name: 'Заполнить выбранные дни', exact: true }).click();
+        await page.getByRole('button', { name: 'Сохранить всё', exact: true }).click();
+        await page.getByRole('button', { name: 'Подтвердить сохранение', exact: true }).click();
+        await page.getByRole('heading', { name: 'Расписание сохранено', exact: true }).waitFor();
+        const created = await page.evaluate(() => window.mutations.filter(item => item.type === 'create'));
+        assert.equal(created.length, 5);
+        assert.ok(created.every(item => item.payload.repeatWeekly === false && item.payload.orderDeliveryIntervalStart));
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
+test('Одноразовое копирование восстанавливается после потери ответа без дублей', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 45000
+}, async () => {
+    const { browser, page, dates } = await fixture();
+    try {
+        await seedCopy(page, dates, 'once');
+        await page.getByRole('button', { name: 'Сохранить всё', exact: true }).click();
+        await page.getByRole('button', { name: 'Везде заменить', exact: true }).click();
+        await page.evaluate(() => { window.failNextCreate = true; });
+        await page.getByRole('button', { name: 'Подтвердить сохранение', exact: true }).click();
+        await page.getByRole('heading', { name: 'Сохранение остановлено', exact: true }).waitFor();
+        await page.getByRole('button', { name: 'Проверить результат и продолжить', exact: true }).click();
+        await page.getByRole('heading', { name: 'Расписание сохранено', exact: true }).waitFor();
+        assert.equal(await page.evaluate(() => window.mutations.filter(item => item.type === 'create').length), 2);
     } finally { await browser.close(); }
 });
 

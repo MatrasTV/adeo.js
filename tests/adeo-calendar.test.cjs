@@ -8,7 +8,8 @@ const vm = require('node:vm');
 const names = ['scheduleDay', 'parseScheduleDay', 'addScheduleDays', 'scheduleWeekday', 'nextScheduleWeekday',
     'nextScheduleDelivery', 'scheduleTimestamp', 'scheduleHourLabel', 'scheduleEventToDraft', 'scheduleDraftPayload',
     'validateScheduleDraft', 'buildScheduleWeek', 'copyScheduleDrafts', 'findScheduleConflicts', 'makeSchedulePlan',
-    'createScheduleAdapter', 'runSchedulePlan', 'reconcileSchedulePlan', 'findScheduleProxy', 'scheduleFingerprint', 'describeScheduleRequestError', 'makeScheduleClearPlan'];
+    'createScheduleAdapter', 'runSchedulePlan', 'reconcileSchedulePlan', 'findScheduleProxy', 'scheduleFingerprint', 'describeScheduleRequestError', 'makeScheduleClearPlan',
+    'missingScheduleCopies'];
 const source = readFileSync(resolve(__dirname, '../adeo.user.js'), 'utf8').replace(
     '    installLoadingProgress();', `    globalThis.calendar = { ${names.join(',')} }; return;`
 );
@@ -32,6 +33,12 @@ function event(id, date, changes = {}) {
 }
 function group(date, entries, nfiles = [7]) {
     return { date, enabled: true, nfiles, entries };
+}
+
+function oncePlan(events, drafts, supplierId, deliveryDays, today = api.scheduleDay()) {
+    const date = drafts[0].sendDate;
+    return api.makeSchedulePlan(events, [{ ...group(date, drafts, drafts.map(row => row.nfile)), repeatWeekly: false }],
+        { [date]: 'add' }, supplierId, deliveryDays, today);
 }
 
 test('Срок в календарных днях переносит воскресенье на понедельник', () => {
@@ -96,6 +103,59 @@ test('Формат CRM содержит часовой пояс, последн�
     assert.equal(api.scheduleHourLabel(23), '23:00–23:59');
     assert.deepEqual(plain(api.scheduleEventToDraft({ ...payload, nfile: null })).nfile, null);
     assert.throws(() => api.scheduleEventToDraft({ ...payload, orderDeliveryIntervalStart: '2026-10-28T15:30:00' }), /нестандартный/);
+});
+
+test('Выбранная одноразовая копия создаётся на праздник независимо от повторов следующей недели', () => {
+    const draft = row('2026-11-04', { nfile: null });
+    const events = [event(1, '2026-11-11', { nfile: null })];
+    assert.equal(api.missingScheduleCopies(events, [draft], 127).length, 1);
+    const plan = oncePlan(events, [draft], 127, weekdays, '2026-11-03');
+    assert.equal(plan.operations.length, 1);
+    assert.deepEqual(plain(plan.operations[0]), { type: 'create', payload: {
+        ...plain(api.scheduleDraftPayload(draft, 127)), repeatWeekly: false
+    } });
+    assert.equal(plan.operations[0].payload.nfile, null);
+});
+
+test('Разовое копирование дополняет только отсутствующие записи и блокирует пересечение на той же дате', () => {
+    const drafts = [row('2026-11-04'), row('2026-11-04', { sendTime: '12:00', haveDelivery: false, deliveryDate: '' })];
+    for (const weeklyScheduleId of [0, 50]) {
+        const saved = event(1, '2026-11-04', { weeklyScheduleId });
+        const plan = oncePlan([saved], drafts, 127, weekdays, '2026-11-03');
+        assert.equal(plan.operations.length, 1);
+        assert.match(plan.operations[0].payload.ordersAcceptedAt, /T12:00/);
+        assert.equal(plan.operations[0].payload.orderDeliveryIntervalStart, null);
+    }
+    assert.throws(() => oncePlan([event(1, '2026-11-04', { nfile: null, orderDeliveryIntervalStart: null })],
+        drafts, 127, weekdays, '2026-11-03'), /уже существует/);
+    assert.throws(() => oncePlan([], drafts, 127, weekdays, '2026-11-04'), /будущую дату/);
+});
+
+test('Одноразовая замена удаляет только выбранный экземпляр повтора', () => {
+    const events = [event(1, '2026-11-04', { weeklyScheduleId: 50 }), event(2, '2026-11-11', { weeklyScheduleId: 50 })];
+    const groups = [{ ...group('2026-11-04', [row('2026-11-04')]), repeatWeekly: false }];
+    const plan = api.makeSchedulePlan(events, groups, { '2026-11-04': 'replace' }, 127, weekdays, '2026-11-03');
+    assert.deepEqual(Array.from(plan.operations, operation => [operation.type, operation.event?.id, operation.future]),
+        [['remove', 1, false], ['create', undefined, undefined]]);
+    assert.equal(plan.operations[1].payload.repeatWeekly, false);
+});
+
+test('Потерянный ответ разового копирования проверяется без повторного создания', async () => {
+    const date = tomorrow();
+    const draft = row(date, { haveDelivery: false, deliveryDate: '' });
+    const job = oncePlan([], [draft], 127, weekdays);
+    const saved = [];
+    let calls = 0;
+    const adapter = { async create(payload) {
+        calls++; saved.push({ ...payload, id: 1, weeklyScheduleId: 0 }); throw new Error('Ответ потерян');
+    }, async list() { return saved; } };
+    await assert.rejects(api.runSchedulePlan(job, adapter, () => {}), /одноразовой записи/);
+    assert.equal(await api.reconcileSchedulePlan(job, adapter, 127), true);
+    await api.runSchedulePlan(job, adapter, () => {});
+    assert.equal(calls, 1);
+    assert.equal(oncePlan(saved, [draft], 127, weekdays).operations.length, 0);
+    const weeklyJob = { ...job, index: 0, uncertain: true, operations: [{ type: 'create', payload: api.scheduleDraftPayload(draft, 127) }] };
+    assert.equal(await api.reconcileSchedulePlan(weeklyJob, adapter, 127), false);
 });
 
 test('Замена выбирает будущий экземпляр каждого повтора, не затрагивая другой склад', () => {
