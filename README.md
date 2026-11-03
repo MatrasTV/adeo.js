@@ -1,6 +1,6 @@
 # adeo.js
 
-Единый скрипт Tampermonkey для работы с прайсами ADEO и расписанием поставщиков AdeoCRM. Файл для установки: [adeo.user.js](adeo.user.js), версия **3.4.1**.
+Единый скрипт Tampermonkey для работы с прайсами ADEO и расписанием поставщиков AdeoCRM. Файл для установки: [adeo.user.js](adeo.user.js), версия **3.4.0**.
 
 ## Установка из GitHub Releases
 
