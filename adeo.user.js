@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADEO — прайсы и расписание поставщиков
 // @namespace    admin.adeo.pro
-// @version      3.4.1
+// @version      3.4.2
 // @description  Работа с прайсами и мастер расписания поставщиков CRM
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
@@ -13,6 +13,7 @@
 // @match        https://admin.adeo.pro/admin/admin_pricerelevance/list*
 // @match        https://admin.adeo.pro/admin/supplier/price/compare/*
 // @match        https://admin.adeo.pro/admin/supplier/price/comparemode/*
+// @match        https://avatar.adeo.pro/istat.php*
 // @match        https://crm.adeo.pro/*
 // @run-at       document-start
 // @grant        none
@@ -132,6 +133,32 @@
     function getCellText(row, column, partial = false) {
         const operator = partial ? '*=' : '=';
         return row.querySelector(`td[aria-describedby${operator}"${column}"]`)?.textContent.trim() ?? '';
+    }
+
+    function initImportStatistics() {
+        observePage(() => {
+            document.querySelectorAll('tr.jqgrow > td[aria-describedby$="_sklad"]').forEach(cell => {
+                const column = cell.getAttribute('aria-describedby');
+                const id = getCellText(cell.parentElement, column.replace(/_sklad$/, '_supplier_id'));
+                const supplier = cell.textContent.trim();
+                const fileNumber = supplier.match(/\/\s*(\d+)\s*$/)?.[1];
+                if (!/^\d+$/.test(id) || !fileNumber) return;
+                const href = `https://admin.adeo.pro/admin/supplier/price/compare/${id}/${fileNumber}`;
+                let link = cell.querySelector('a.adeo-istat-compare');
+                if (!link) {
+                    link = document.createElement('a');
+                    link.className = 'adeo-istat-compare';
+                    link.textContent = supplier;
+                    link.target = '_blank';
+                    link.rel = 'noopener noreferrer';
+                    link.title = 'Открыть сравнение прайса в новой вкладке';
+                    // Открытие ссылки не должно переключать выбранную строку jqGrid.
+                    link.addEventListener('click', event => event.stopPropagation());
+                    cell.replaceChildren(link);
+                }
+                if (link.getAttribute('href') !== href) link.setAttribute('href', href);
+            });
+        });
     }
 
     function getSupplierKey(row) {
@@ -1894,6 +1921,7 @@
         if (/^\/admin\/admin_pricerelevance\/list\/?$/.test(path)) initPriceRelevance();
         else if (path.startsWith('/admin/supplier/price/compare/')) initCompare();
         else if (path.startsWith('/admin/supplier/price/comparemode/')) initCompareMode();
+        else if (window.location.hostname === 'avatar.adeo.pro' && path === '/istat.php') initImportStatistics();
         else if (window.location.hostname === 'crm.adeo.pro') initSupplierCalendar();
     }
 
