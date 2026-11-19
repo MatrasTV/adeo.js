@@ -5,16 +5,24 @@ const { resolve, basename } = require('node:path');
 const vm = require('node:vm');
 
 const source = readFileSync(resolve(__dirname, '../adeo.user.js'), 'utf8');
-const xlsxPath = process.env.ADEO_XLSX_LIBRARY;
-const decimalPath = process.env.ADEO_DECIMAL_LIBRARY;
+const xlsxPath = process.env.ADEO_XLSX_LIBRARY || resolve(__dirname, '../assets/vendor/xlsx-0.20.3.js');
+const decimalPath = process.env.ADEO_DECIMAL_LIBRARY || resolve(__dirname, '../assets/vendor/decimal-10.6.0.js');
 const librariesAvailable = xlsxPath && decimalPath && existsSync(xlsxPath) && existsSync(decimalPath);
 let XLSX, Decimal, chromium;
 if (librariesAvailable) { XLSX = require(xlsxPath); Decimal = require(decimalPath); }
 try { ({ chromium } = require('playwright')); } catch { /* Браузерные сценарии требуют Playwright. */ }
 const context = vm.createContext({});
-vm.runInContext(source.replace('    installLoadingProgress();', '    globalThis.calculate = calculateRelevanceWorkbook; return;'), context);
+vm.runInContext(source.replace('    installLoadingProgress();', '    globalThis.calculate = calculateRelevanceWorkbook; globalThis.workerSources = getRelevanceWorkerSources; return;'), context);
 const plain = value => JSON.parse(JSON.stringify(value));
 const skipLibraries = !librariesAvailable && 'Задайте ADEO_XLSX_LIBRARY и ADEO_DECIMAL_LIBRARY: пути к SheetJS 0.20.3 и decimal.js 10.6.0';
+
+test('Установочный файл содержит обе библиотеки и не требует загрузки модулей по сети', () => {
+    const bundled = {};
+    vm.runInNewContext(context.workerSources(), bundled);
+    assert.equal(bundled.XLSX.version, '0.20.3');
+    assert.equal(new bundled.Decimal('0.1').plus('0.2').toString(), '0.3');
+    assert.doesNotMatch(source.slice(0, source.indexOf('// НАЧАЛО ВСТРОЕННЫХ БИБЛИОТЕК АНАЛИЗА')), /importScripts\(|libraries:|RELEVANCE_XLSX_URL/);
+});
 
 function workbook(rows, name = 'price_analyse_result') {
     const result = XLSX.utils.book_new();
@@ -91,8 +99,7 @@ test('Автоанализ: прошлый результат, новые зад
         const errors = []; page.on('pageerror', error => errors.push(error.message));
         let state = { message: 'Файл сформирован. <a href="/admin/admin_pricerelevance/download">Загрузить</a>', inProcess: false };
         let downloads = 0, upload, heldDownload, holdDownload = false, failDownload = false, uploadReply = null;
-        let releaseLibraries;
-        let gate = new Promise(resolve => { releaseLibraries = resolve; });
+        let externalRequests = 0;
         const data = rows();
         for (let i = 1; i < 1000; i++) data.push(['B', String(i), 'Товар', 3, 10, 2, 12]);
         data.push(['B', 'bad', 'Ошибка', 1, 10, 2, 'ошибка']);
@@ -100,12 +107,7 @@ test('Автоанализ: прошлый результат, новые зад
         const bytes = Buffer.from(XLSX.write(workbook(data), { type: 'buffer', bookType: 'xlsx' }));
         await browserContext.route('**/*', async route => {
             const url = new URL(route.request().url());
-            if (url.host === 'cdn.sheetjs.com') {
-                await gate;
-                // Замедляем чтение в отдельном потоке, чтобы проверить отзывчивость страницы.
-                return route.fulfill({ contentType: 'application/javascript', body: readFileSync(xlsxPath, 'utf8') + '\nconst originalRead = XLSX.read; XLSX.read = function(...args) { const end = Date.now()+350; while(Date.now()<end) {} return originalRead(...args); };' });
-            }
-            if (url.host === 'cdn.jsdelivr.net') return route.fulfill({ contentType: 'application/javascript', body: readFileSync(decimalPath) });
+            if (url.host !== 'admin.adeo.pro') { externalRequests++; return route.abort('blockedbyclient'); }
             if (url.pathname.endsWith('/state')) return route.fulfill({ json: state });
             if (url.pathname.endsWith('/download')) {
                 downloads++;
@@ -129,7 +131,12 @@ test('Автоанализ: прошлый результат, новые зад
             }
             return route.fulfill({ status: 404, body: '' });
         });
-        await page.addInitScript({ content: source.replace('    installLoadingProgress();', '    window.analysisDebug = { relevanceAnalysis, relevanceProgress };\n    installLoadingProgress();') });
+        // Замедляем первый запуск и чтение в отдельном потоке, не подменяя настоящие библиотеки.
+        const delay = 'const readyAt = Date.now()+2200; while(Date.now()<readyAt) {}\n;';
+        const readDelay = '\n;const originalRead = XLSX.read; XLSX.read = function(...args) { const end = Date.now()+350; while(Date.now()<end) {} return originalRead(...args); };\n;';
+        const slowSource = source.replace('getRelevanceWorkerSources(),',
+            `((window.analysisWorkerCount = (window.analysisWorkerCount || 0) + 1) === 1 ? ${JSON.stringify(delay)} : ''), getRelevanceWorkerSources(), ${JSON.stringify(readDelay)},`);
+        await page.addInitScript({ content: slowSource.replace('    installLoadingProgress();', '    window.analysisDebug = { relevanceAnalysis, relevanceProgress };\n    installLoadingProgress();') });
         await page.goto('https://admin.adeo.pro/admin/admin_pricerelevance/list');
         await page.waitForFunction(() => document.querySelector('.adeo-relevance-bar')?.dataset.stage === 'done');
         assert.match(await page.locator('.adeo-relevance-title').innerText(), /Предыдущий/);
@@ -163,7 +170,6 @@ test('Автоанализ: прошлый результат, новые зад
         assert.equal(await page.locator('.adeo-relevance-settings').isVisible(), true, 'Интерфейс отвечает во время фонового анализа');
         await page.waitForFunction(() => /Анализ: [1-9]/.test(document.querySelector('.adeo-relevance-time').textContent));
         assert.match(await page.locator('.adeo-relevance-time').innerText(), /Анализ: [1-9]/);
-        releaseLibraries();
         await page.waitForFunction(() => document.querySelector('.adeo-relevance-bar').dataset.analysisPhase === 'reading');
         await page.waitForFunction(() => document.querySelector('.adeo-relevance-bar').dataset.analysisPhase === 'done');
         assert.deepEqual(await page.locator('.adeo-analysis-grid strong').allTextContents(), ['20 000 ₽', '1 000', '1 001', '-20,00%', '20 000 ₽']);
@@ -235,6 +241,7 @@ test('Автоанализ: прошлый результат, новые зад
         await poll();
         await page.waitForFunction(() => document.querySelector('.adeo-relevance-bar').dataset.analysisPhase === 'done');
         assert.equal(downloads, beforeUnconfirmed + 1);
+        assert.equal(externalRequests, 0, 'Анализ должен работать при полной блокировке внешних библиотек');
         assert.deepEqual(errors, []);
         await browserContext.close();
     } finally { await browser.close(); }
