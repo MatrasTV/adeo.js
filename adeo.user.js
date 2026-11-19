@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADEO — прайсы и расписание поставщиков
 // @namespace    admin.adeo.pro
-// @version      3.4.2
+// @version      3.5.0
 // @description  Работа с прайсами и мастер расписания поставщиков CRM
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
@@ -31,6 +31,13 @@
     const priceDifferenceValues = new WeakMap();
     const loadingRequests = new Map();
     let hideReg = true;
+    const relevanceProgress = { stage: 'idle', message: '', busy: false, percent: null,
+        started: null, finished: null, warning: '', links: [], revision: 0, uploading: false, notify() {} };
+    const relevanceAnalysis = { phase: 'idle', revision: 0, armed: false, accepted: false, token: 0,
+        percent: null, message: '', result: null, started: null, finished: null, worker: null,
+        controller: null, blob: null, blobUrl: '', fileName: '', source: '', timer: null };
+    const RELEVANCE_XLSX_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
+    const RELEVANCE_DECIMAL_URL = 'https://cdn.jsdelivr.net/npm/decimal.js@10.6.0/decimal.js';
 
     // Следим за появлением элементов и обновлением текста без постоянного опроса.
     function observePage(update) {
@@ -38,7 +45,7 @@
             // Тики таймера загрузки не должны повторно обходить всю таблицу.
             if (mutations.every(mutation => {
                 const element = mutation.target.nodeType === 3 ? mutation.target.parentElement : mutation.target;
-                return element?.closest?.('.adeo-loading');
+                return element?.closest?.('.adeo-loading, .adeo-relevance-bar');
             })) return;
             update();
         });
@@ -111,7 +118,664 @@
             fillFieldOnce('input[name="start_date"]', getPreviousMonthDate());
             setCheckboxOnce(document.querySelector('input[name="orders_avg_cost"]'), false);
             setCheckboxOnce(document.querySelector('input[name="orders_max_cost"]'), false);
+            enhancePriceRelevance();
         });
+    }
+
+    // Процент относится только к строкам или передаче файла, а не ко всей работе сервера.
+    function parseRelevanceStatus(text) {
+        if (!text.trim()) return { stage: 'idle', percent: null };
+        if (/ошиб|не удалось|необходимым параметром/i.test(text)) return { stage: 'error', percent: null };
+        if (/файл сформирован/i.test(text)) return { stage: 'done', percent: null };
+        if (/подготовка результата/i.test(text)) return { stage: 'preparing', percent: null };
+        const rows = text.match(/обработано\s*:?\s*([\d\s\u00a0]+?)\s+строк(?:и|а)?\s+из\s+([\d\s\u00a0]+)/i);
+        if (rows) {
+            const processed = Number(rows[1].replace(/\s/g, ''));
+            const total = Number(rows[2].replace(/\s/g, ''));
+            return { stage: 'processing', processed, total,
+                percent: total > 0 ? Math.min(100, Math.max(0, processed / total * 100)) : null };
+        }
+        if (/начата обработка/i.test(text)) return { stage: 'processing', percent: null };
+        if (/ожидается обработка|очеред/i.test(text)) return { stage: 'queued', percent: null };
+        return { stage: 'unknown', percent: null };
+    }
+
+    function decodeRelevanceMessage(value) {
+        const text = String(value ?? '');
+        // POST /list может возвращать JSON-строку с \uXXXX, а также обычный текст или HTML.
+        try {
+            const decoded = JSON.parse(text);
+            if (typeof decoded === 'string') return decoded;
+        } catch { /* Обычные сообщения и HTML не требуют декодирования JSON. */ }
+        return text;
+    }
+
+    function applyRelevanceMessage(html, inProcess) {
+        const template = document.createElement('template');
+        template.innerHTML = decodeRelevanceMessage(html);
+        const message = template.content.textContent.trim();
+        const parsed = parseRelevanceStatus(message);
+        const state = relevanceProgress;
+        Object.assign(state, parsed, { message, warning: '', links: [] });
+        // Переносим только текст и безопасные ссылки результата, сохраняя штатное скачивание.
+        template.content.querySelectorAll('a[href]').forEach(link => {
+            try {
+                const url = new URL(link.getAttribute('href'), window.location.href);
+                if (url.origin === window.location.origin && /^https?:$/.test(url.protocol)) {
+                    state.links.push({ href: url.href, text: link.textContent.trim() || 'Загрузить результат' });
+                }
+            } catch { /* Некорректная ссылка не должна мешать обновлению статуса. */ }
+        });
+        const active = ['queued', 'processing', 'preparing'].includes(state.stage);
+        if (state.revision > 0 && relevanceAnalysis.armed && (active || inProcess === true)) relevanceAnalysis.accepted = true;
+        // В очереди сервер возвращает inProcess=false: это ещё не завершение задания.
+        state.busy = active || inProcess === true;
+        if (state.busy && !state.started) state.started = Date.now();
+        if (state.busy) state.finished = null;
+        else if (state.started && !state.finished) state.finished = Date.now();
+        if (state.stage === 'error') relevanceAnalysis.armed = false;
+        state.notify();
+        if (state.stage === 'done' && !state.busy && relevanceAnalysis.armed && relevanceAnalysis.accepted && state.links.length) {
+            relevanceAnalysis.armed = false;
+            void startRelevanceAnalysis();
+        }
+    }
+
+    function relevanceAnalysisRunning() {
+        return ['downloading', 'loading', 'reading', 'calculating'].includes(relevanceAnalysis.phase);
+    }
+
+    function stopRelevanceAnalysis(message = '') {
+        const analysis = relevanceAnalysis;
+        analysis.token++;
+        analysis.controller?.abort(); analysis.controller = null;
+        analysis.worker?.terminate(); analysis.worker = null;
+        clearTimeout(analysis.timer); analysis.timer = null;
+        if (message) {
+            Object.assign(analysis, { phase: 'error', message, percent: null, finished: Date.now(), armed: false });
+            relevanceProgress.notify();
+        }
+    }
+
+    function resetRelevanceAnalysis(body) {
+        stopRelevanceAnalysis();
+        const analysis = relevanceAnalysis;
+        if (analysis.blobUrl) URL.revokeObjectURL(analysis.blobUrl);
+        Object.assign(analysis, { phase: 'idle', revision: relevanceProgress.revision, armed: true, accepted: false,
+            percent: null, message: '', result: null, started: null, finished: null, blob: null, blobUrl: '', source: '',
+            fileName: '', sourceName: body?.get?.('price')?.name || '', outputStart: body?.get?.('outStart') ?? null });
+    }
+
+    // Эта функция выполняется в отдельном потоке; денежные операции повторяют Decimal в ARM.
+    function calculateRelevanceWorkbook(workbook, XLSX, Decimal, progress = () => {}) {
+        Decimal.set({ precision: 28, rounding: Decimal.ROUND_HALF_EVEN });
+        const normalize = value => String(value ?? '').replace(/\u00a0/g, ' ').trim().replace(/\s+/g, ' ').toLowerCase();
+        const number = value => {
+            if (value === null || value === undefined || typeof value === 'boolean') return null;
+            const text = String(value).replace(/[ \u00a0]/g, '').trim().replace(',', '.');
+            if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(text)) return null;
+            try { const result = new Decimal(text); return result.isFinite() ? result : null; } catch { return null; }
+        };
+        const cell = (sheet, row, col) => {
+            const value = sheet[XLSX.utils.encode_cell({ r: row, c: col })];
+            return value?.t === 'e' ? null : value?.v;
+        };
+        const candidates = [];
+        let ambiguous = false;
+        for (const name of workbook.SheetNames) {
+            const sheet = workbook.Sheets[name];
+            if (!sheet?.['!ref']) continue;
+            const range = XLSX.utils.decode_range(sheet['!ref']);
+            const orders = [], minimum = [];
+            for (let row = 0; row <= Math.min(9, range.e.r); row++) {
+                for (let col = 5; col <= range.e.c; col++) {
+                    const header = normalize(cell(sheet, row, col));
+                    if (header.startsWith('заказов адео')) orders.push({ row, col });
+                    if (header === 'мин. цена заказа') minimum.push({ row, col });
+                }
+            }
+            if (orders.length > 1 || minimum.length > 1) { ambiguous = true; continue; }
+            if (orders.length !== 1 || minimum.length !== 1 || range.e.c < 4) continue;
+            const first = Math.max(orders[0].row, minimum[0].row) + 1;
+            let start = first;
+            for (; start <= range.e.r; start++) {
+                const identity = [0, 1, 2].some(col => ![undefined, null, ''].includes(cell(sheet, start, col)));
+                if (identity && (number(cell(sheet, start, 3)) !== null || number(cell(sheet, start, 4)) !== null)) break;
+            }
+            if (start > range.e.r) throw new Error('В Excel-файле не найдены строки данных.');
+            candidates.push({ name, sheet, start, end: range.e.r, lastColumn: range.e.c, orders: orders[0].col, minimum: minimum[0].col });
+        }
+        candidates.sort((a, b) => Number(!a.name.toLowerCase().includes('price_analyse_result')) - Number(!b.name.toLowerCase().includes('price_analyse_result')));
+        if (!candidates.length) throw new Error(ambiguous ? 'Невозможно однозначно определить столбцы: найдены повторяющиеся заголовки.' :
+            'Не найдены столбцы «Заказов АДЕО» и «Мин. цена заказа» начиная с F в первых 10 строках. Включите их в настройках формирования файла.');
+        const structure = candidates[0];
+        let rub = new Decimal(0), maximum = new Decimal(0), percentages = new Decimal(0);
+        let percentageCount = 0, ordered = 0, total = 0, skipped = 0, warningCount = 0;
+        const warnings = [];
+        const errors = [];
+        const unprocessedBrands = new Set();
+        const brandHeaders = new Set(['brand', 'brands', 'brand name', 'brandname', 'manufacturer', 'manufacturers',
+            'make', 'maker', 'producer', 'firm', 'marque', 'trademark', 'vendor',
+            'бренд', 'бренды', 'брэнд', 'брэнды', 'фирма', 'производитель', 'производители', 'марка', 'изготовитель',
+            'торговая марка', 'название бренда', 'наименование бренда', 'название производителя', 'наименование производителя']);
+        const isBrandHeader = value => normalize(value).replace(/[:：]+$/, '').replace(/_/g, ' ')
+            .split(/\s*[/\\|]\s*/).every(part => brandHeaders.has(part.trim().replace(/\s+/g, ' ')));
+        const fields = [['Наличие', 3], ['Цена', 4], ['Заказов АДЕО', structure.orders], ['Мин. цена заказа', structure.minimum]];
+        const warn = (row, field, reason) => {
+            warningCount++;
+            if (warnings.length < 200) warnings.push({ row: row + 1, field, reason });
+        };
+        const rowCount = structure.end - structure.start + 1;
+        for (let row = structure.start; row <= structure.end; row++) {
+            const processed = row - structure.start + 1;
+            if (processed === 1 || processed % 500 === 0 || processed === rowCount) progress(processed, rowCount);
+            const footer = String(cell(structure.sheet, row, 0) ?? '').trim().match(/^не\s+найдены\s+бренды(?:\s*:\s*([\s\S]*))?\s*$/i);
+            if (footer) {
+                const values = [footer[1] ?? ''];
+                for (let col = 1; col <= structure.lastColumn; col++) values.push(String(cell(structure.sheet, row, col) ?? ''));
+                const brands = new Map();
+                values.forEach(value => value.split(/[,;\r\n]+/).forEach(part => {
+                    const brand = part.trim().replace(/\s+/g, ' ');
+                    const key = normalize(brand);
+                    // Заголовок исходного прайса иногда попадает в серверный список ошибок.
+                    if (key && !isBrandHeader(brand) && !brands.has(key)) { brands.set(key, brand); unprocessedBrands.add(key); }
+                }));
+                if (brands.size) errors.push({ code: 'UNPROCESSED_BRANDS', row: row + 1, brands: Array.from(brands.values()) });
+                // Итоговая служебная строка не участвует в денежных расчётах.
+                continue;
+            }
+            const rawMinimum = cell(structure.sheet, row, structure.minimum);
+            if (rawMinimum === null || rawMinimum === undefined || !String(rawMinimum).trim()) continue;
+            total++;
+            const values = fields.map(([, col]) => number(cell(structure.sheet, row, col)));
+            let invalid = false;
+            values.forEach((value, index) => {
+                if (value === null) { invalid = true; warn(row, fields[index][0], 'Не удалось преобразовать значение в число'); }
+            });
+            if (invalid) { skipped++; continue; }
+            const [availability, price, orders, minimum] = values;
+            const quantity = Decimal.min(availability, orders);
+            if (price.lte(minimum)) { rub = rub.plus(price.times(quantity)); ordered++; }
+            maximum = maximum.plus(Decimal.min(price, minimum).times(quantity));
+            if (!price.isZero()) { percentages = percentages.plus(price.minus(minimum).div(price)); percentageCount++; }
+            else warn(row, 'Цена', 'Процент не рассчитан: цена равна нулю');
+        }
+        return {
+            result: { rub_sum: rub.trunc().toFixed(0), ordered_from_supplier: ordered, total_orders: total,
+                average_percent: percentageCount ? percentages.div(percentageCount).times(100).toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2) : null,
+                maximum_rub: maximum.trunc().toFixed(0) },
+            meta: { sheet_name: structure.name, data_start_row: structure.start + 1, processed_rows: rowCount,
+                skipped_rows: skipped, warning_count: warningCount, error_count: errors.length, unprocessed_brand_count: unprocessedBrands.size,
+                detected_columns: { availability: 'D', price: 'E',
+                    orders: XLSX.utils.encode_col(structure.orders), minimum_order_price: XLSX.utils.encode_col(structure.minimum) } }, warnings, errors
+        };
+    }
+
+    function relevanceAnalysisWorker(calculate) {
+        self.onmessage = event => {
+            try {
+                self.postMessage({ phase: 'loading', message: 'Подготовка модуля анализа…' });
+                try { importScripts(...event.data.libraries); }
+                catch { throw new Error('Не удалось загрузить модуль анализа. Проверьте соединение и повторите анализ.'); }
+                self.postMessage({ phase: 'reading', message: 'Чтение Excel-файла… На больших файлах это может занять время.' });
+                let workbook;
+                try { workbook = XLSX.read(event.data.buffer, { type: 'array', cellFormula: false, cellHTML: false, cellText: false }); }
+                catch { throw new Error('Не удалось прочитать Excel-файл: файл повреждён или имеет неподдерживаемый формат.'); }
+                self.postMessage({ phase: 'calculating', message: 'Определение столбцов и расчёт показателей…' });
+                const result = calculate(workbook, XLSX, Decimal, (processed, total) => {
+                    self.postMessage({ phase: 'calculating', percent: processed / total * 100,
+                        message: `Проанализировано ${processed} строк из ${total}` });
+                });
+                self.postMessage({ phase: 'done', message: 'Анализ завершён', result });
+            } catch (error) { self.postMessage({ phase: 'error', message: error.message || 'Не удалось проанализировать файл.' }); }
+        };
+    }
+
+    async function startRelevanceAnalysis() {
+        const analysis = relevanceAnalysis;
+        const state = relevanceProgress;
+        const link = state.links[0];
+        if (relevanceAnalysisRunning() || state.busy || state.stage !== 'done' || !link) return;
+        stopRelevanceAnalysis();
+        const token = analysis.token;
+        const revision = state.revision;
+        Object.assign(analysis, { phase: 'downloading', armed: false, revision, started: Date.now(), finished: null,
+            percent: null, message: 'Получение готового Excel для анализа…', result: null });
+        state.notify();
+        const current = () => token === analysis.token && revision === state.revision;
+        const fail = message => { if (current()) stopRelevanceAnalysis(message); };
+        try {
+            if (analysis.outputStart !== null && analysis.outputStart !== undefined && Number(analysis.outputStart) < 5) {
+                throw new Error('Для анализа по правилам ARM добавляйте результирующие колонки после 5-го столбца или дальше, чтобы сохранить наличие в D и цену в E.');
+            }
+            let buffer;
+            if (analysis.blob && analysis.source === link.href) buffer = await analysis.blob.arrayBuffer();
+            else {
+                analysis.controller = new AbortController();
+                analysis.timer = setTimeout(() => fail('Сервер слишком долго передаёт результат. Можно повторить анализ или скачать Excel.'), 90000);
+                const response = await fetch(link.href, { credentials: 'same-origin', cache: 'no-store', signal: analysis.controller.signal });
+                if (!current()) return;
+                if (!response.ok) throw new Error(`Не удалось получить результат: HTTP ${response.status}.`);
+                const limit = 50 * 1024 * 1024;
+                if (Number(response.headers.get('content-length')) > limit) throw new Error('Файл больше 50 МБ. Скачайте его для анализа вне браузера.');
+                const reader = response.body.getReader();
+                const chunks = []; let length = 0;
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (!current()) { await reader.cancel(); return; }
+                    if (done) break;
+                    length += value.byteLength;
+                    if (length > limit) { await reader.cancel(); throw new Error('Файл больше 50 МБ. Скачайте его для анализа вне браузера.'); }
+                    chunks.push(value);
+                }
+                buffer = new Uint8Array(length);
+                let offset = 0;
+                for (const chunk of chunks) { buffer.set(chunk, offset); offset += chunk.length; }
+                buffer = buffer.buffer;
+                const bytes = new Uint8Array(buffer);
+                const xlsx = bytes[0] === 0x50 && bytes[1] === 0x4b;
+                const xls = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1].every((byte, i) => bytes[i] === byte);
+                if (!xlsx && !xls) throw new Error('Вместо Excel сервер вернул другой ответ. Возможно, сессия истекла; обновите страницу.');
+                analysis.blob = new Blob([buffer], { type: xlsx ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' : 'application/vnd.ms-excel' });
+                if (analysis.blobUrl) URL.revokeObjectURL(analysis.blobUrl);
+                analysis.blobUrl = URL.createObjectURL(analysis.blob);
+                analysis.fileName = `price_relevance_result.${xlsx ? 'xlsx' : 'xls'}`;
+                analysis.source = link.href;
+            }
+            if (!current()) return;
+            clearTimeout(analysis.timer); analysis.controller = null;
+            analysis.phase = 'loading'; analysis.message = 'Подготовка модуля анализа…'; state.notify();
+            const workerUrl = URL.createObjectURL(new Blob([`(${relevanceAnalysisWorker.toString()})(${calculateRelevanceWorkbook.toString()});`], { type: 'application/javascript' }));
+            try { analysis.worker = new Worker(workerUrl); }
+            catch { throw new Error('Браузер не разрешил фоновый анализ. Можно скачать Excel или повторить анализ после проверки разрешений браузера.'); }
+            finally { URL.revokeObjectURL(workerUrl); }
+            analysis.worker.onerror = event => {
+                event.preventDefault(); fail('Не удалось запустить модуль анализа. Проверьте доступ к библиотекам и разрешение фоновой обработки в браузере.');
+            };
+            analysis.worker.onmessage = event => {
+                if (!current()) return;
+                Object.assign(analysis, event.data, { percent: event.data.percent ?? null });
+                if (['done', 'error'].includes(analysis.phase)) {
+                    analysis.finished = Date.now(); analysis.worker.terminate(); analysis.worker = null;
+                    clearTimeout(analysis.timer); analysis.timer = null;
+                }
+                state.notify();
+            };
+            analysis.timer = setTimeout(() => fail('Анализ выполняется дольше 5 минут и остановлен. Можно повторить его или скачать Excel.'), 300000);
+            analysis.worker.postMessage({ buffer, libraries: [RELEVANCE_XLSX_URL, RELEVANCE_DECIMAL_URL] }, [buffer]);
+        } catch (error) { fail(error.name === 'TypeError' ? 'Не удалось получить файл для анализа. Проверьте соединение и повторите попытку.' : error.message || 'Не удалось проанализировать файл.'); }
+    }
+
+    // Наблюдаем за штатными запросами страницы: дополнительных отправок и опросов нет.
+    function installRelevanceProgress() {
+        if (!/^\/admin\/admin_pricerelevance\/list\/?$/.test(window.location.pathname) ||
+            typeof XMLHttpRequest === 'undefined') return;
+        const prototype = XMLHttpRequest.prototype;
+        const originalOpen = prototype.open;
+        const originalSend = prototype.send;
+        const requests = new WeakMap();
+        let pollSequence = 0;
+        let lastPoll = 0;
+        prototype.open = function (method, url, ...args) {
+            requests.delete(this);
+            const result = originalOpen.call(this, method, url, ...args);
+            const address = new URL(url, window.location.href);
+            const verb = String(method).toUpperCase();
+            if (address.origin === window.location.origin) {
+                if (verb === 'POST' && /^\/admin\/admin_pricerelevance\/list\/?$/.test(address.pathname)) requests.set(this, 'upload');
+                if (verb === 'GET' && address.pathname === '/admin/admin_pricerelevance/state') requests.set(this, 'state');
+            }
+            return result;
+        };
+        prototype.send = function (body) {
+            const kind = requests.get(this);
+            if (!kind) return originalSend.call(this, body);
+            const state = relevanceProgress;
+            if (kind === 'upload') {
+                Object.assign(state, { stage: 'uploading', busy: true, uploading: true, percent: null,
+                    message: 'Отправляем файл на сервер…', links: [], warning: '', started: Date.now(), finished: null,
+                    revision: state.revision + 1 });
+                resetRelevanceAnalysis(body);
+                state.notify();
+                this.upload?.addEventListener('progress', event => {
+                    if (!state.uploading) return;
+                    state.percent = event.lengthComputable && event.total > 0 ? event.loaded / event.total * 100 : null;
+                    state.message = state.percent === 100 ? 'Файл передан. Ожидаем подтверждение сервера…' : 'Отправляем файл на сервер…';
+                    state.notify();
+                });
+            }
+            const revision = state.revision;
+            const sequence = kind === 'state' ? ++pollSequence : 0;
+            const ignoredPoll = kind === 'state' && state.uploading;
+            let settled = false;
+            const fail = message => {
+                if (revision !== state.revision || ignoredPoll || (kind === 'state' && (state.uploading || sequence < lastPoll))) return;
+                if (kind === 'upload') {
+                    relevanceAnalysis.armed = false;
+                    Object.assign(state, { stage: 'error', busy: false, uploading: false, percent: null,
+                        message, finished: Date.now(), links: [] });
+                } else {
+                    lastPoll = sequence;
+                    state.warning = `${message} Повторная проверка статуса — автоматически.`;
+                }
+                state.notify();
+            };
+            this.addEventListener('load', () => {
+                settled = true;
+                if (revision !== state.revision || ignoredPoll || (kind === 'state' && (state.uploading || sequence < lastPoll))) return;
+                if (kind === 'state') lastPoll = sequence;
+                if (this.status < 200 || this.status >= 300) { fail(`Ошибка сервера: HTTP ${this.status}.`); return; }
+                try {
+                    if (kind === 'state') {
+                        const data = this.responseType === 'json' ? this.response : JSON.parse(this.responseText);
+                        if (typeof data?.message !== 'string' || typeof data.inProcess !== 'boolean') throw new Error('Неизвестный ответ');
+                        applyRelevanceMessage(data.message, data.inProcess);
+                    } else {
+                        state.uploading = false;
+                        const message = this.responseType === 'json' ? this.response : this.responseText;
+                        const template = document.createElement('template'); template.innerHTML = decodeRelevanceMessage(message);
+                        // Готовность из ответа самого POST относится к новому заданию.
+                        if (parseRelevanceStatus(template.content.textContent).stage === 'done') relevanceAnalysis.accepted = true;
+                        applyRelevanceMessage(message);
+                        if (state.stage === 'unknown' || state.stage === 'idle') {
+                            Object.assign(state, { stage: 'queued', busy: true, message: state.message || 'Файл отправлен. Ожидаем обработку…', finished: null });
+                            state.notify();
+                        }
+                    }
+                } catch { fail('Не удалось прочитать ответ сервера.'); }
+            });
+            this.addEventListener('loadend', () => {
+                if (!settled) fail('Нет подтверждения от сервера: запрос прерван или потеряна связь. Проверьте статус перед повторной отправкой.');
+            });
+            try { return originalSend.call(this, body); }
+            catch (error) { fail('Не удалось отправить запрос.'); throw error; }
+        };
+    }
+
+    function installRelevanceStyles() {
+        if (document.getElementById('adeo-relevance-styles')) return;
+        const style = document.createElement('style');
+        style.id = 'adeo-relevance-styles';
+        style.textContent = `
+            .adeo-relevance #price-form { border: 1px solid #d8e0e8; border-radius: 6px; background: #f8fafc; color: #26394d; }
+            .adeo-relevance .adeo-relevance-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 12px; }
+            .adeo-relevance #price-form button, .adeo-relevance #submitButton { box-sizing: border-box; min-height: 36px; padding: 7px 14px; border: 1px solid #c4cdd7; border-radius: 4px; background: #fff; color: #26394d; font: 14px Arial, sans-serif; cursor: pointer; }
+            .adeo-relevance #price-form button:hover:not(:disabled) { background: #eaf1f8; border-color: #8faac4; }
+            .adeo-relevance #submitButton { background: #28649a; border-color: #28649a; color: white; }
+            .adeo-relevance #price-form :disabled { opacity: .5; cursor: default; }
+            .adeo-relevance #price-form :focus-visible, .adeo-relevance-bar a:focus-visible { outline: 2px solid #3274b5; outline-offset: 3px; }
+            .adeo-relevance .adeo-file-card { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 12px; padding: 24px; border: 2px dashed #afc3d6; border-radius: 6px; background: #fff; }
+            .adeo-relevance .adeo-file-info { flex: 1; min-width: 180px; overflow-wrap: anywhere; }
+            .adeo-relevance .adeo-file-name { font-weight: bold; margin-bottom: 5px; }
+            .adeo-relevance .adeo-file-hint { color: #597086; font-size: 13px; }
+            .adeo-relevance .adeo-file-error { color: #a52b27; padding: 0 12px; }
+            .adeo-relevance .adeo-relevance-settings { padding: 16px 12px; border-top: 1px solid #d8e0e8; }
+            .adeo-relevance .adeo-relevance-settings input:not([type=checkbox]) { box-sizing: border-box; max-width: 100%; width: 180px; padding: 6px 8px; border: 1px solid #c4cdd7; border-radius: 4px; }
+            .adeo-relevance .adeo-relevance-settings label { display: inline-block; margin-right: 8px; }
+            .adeo-relevance .adeo-relevance-settings input[type=checkbox] { accent-color: #28649a; }
+            .adeo-relevance .adeo-relevance-settings .icheckbox_minimal { position: relative; box-sizing: border-box; width: 18px; height: 18px; background: white !important; border: 1px solid #8faac4; border-radius: 3px; }
+            .adeo-relevance .adeo-relevance-settings .icheckbox_minimal:has(> .icheckbox_minimal) { border: 0; background: transparent !important; }
+            .adeo-relevance .adeo-relevance-settings .icheckbox_minimal:has(> input:checked)::after { content: '✓'; position: absolute; inset: 0; color: #28649a; font: bold 16px/16px Arial, sans-serif; text-align: center; pointer-events: none; }
+            .adeo-relevance .adeo-relevance-settings .icheckbox_minimal:focus-within { outline: 2px solid #3274b5; outline-offset: 2px; }
+            .adeo-relevance [hidden], .adeo-relevance-bar [hidden], .adeo-relevance-drop[hidden] { display: none !important; }
+            .adeo-relevance-bar { padding: 14px 24px; border-top: 1px solid #c4cdd7; background: #f8fafc; color: #26394d; font: 14px/1.45 Arial, sans-serif; }
+            .adeo-relevance-bar[data-stage=error] { border-top-color: #cb625d; background: #fff6f5; }
+            .adeo-relevance-bar[data-stage=done] { border-top-color: #91bfa5; background: #f1faf5; }
+            .adeo-relevance-bar:is([data-analysis-phase=downloading], [data-analysis-phase=loading], [data-analysis-phase=reading], [data-analysis-phase=calculating]) { border-top-color: #c4cdd7; background: #f8fafc; }
+            .adeo-relevance-bar[data-analysis-phase=error] { border-top-color: #cb625d; background: #fff6f5; }
+            .adeo-relevance-head { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+            .adeo-relevance-title { font-size: 16px; font-weight: bold; }
+            .adeo-relevance-time, .adeo-relevance-steps { color: #597086; font-size: 12px; }
+            .adeo-relevance-steps { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 8px; }
+            .adeo-relevance-steps [aria-current=step] { color: #28649a; font-weight: bold; }
+            .adeo-relevance-track { height: 6px; background: #dfe7ef; border-radius: 4px; overflow: hidden; margin: 8px 0; }
+            .adeo-relevance-fill { height: 100%; background: #3274b5; transition: width .25s; }
+            .adeo-relevance-track.adeo-indeterminate .adeo-relevance-fill { width: 28% !important; animation: adeo-relevance-wait 1.8s infinite ease-in-out; }
+            .adeo-relevance-message { overflow-wrap: anywhere; max-height: 4.5em; overflow: auto; }
+            .adeo-relevance-warning { color: #9b4331; }
+            .adeo-result-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+            .adeo-relevance-links, .adeo-analysis-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+            .adeo-relevance-links a { display: inline-block; padding: 6px 12px; background: #28649a; color: white; border-radius: 4px; }
+            .adeo-analysis-results { margin-top: 16px; border-top: 1px solid #d8e0e8; padding-top: 14px; }
+            .adeo-analysis-results h3 { font: bold 16px/1.5 Arial, sans-serif; margin: 0 0 12px; overflow-wrap: anywhere; }
+            .adeo-analysis-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+            .adeo-analysis-grid article { background: white; border: 1px solid #d8e0e8; border-radius: 5px; padding: 12px; min-width: 0; }
+            .adeo-analysis-grid span { display: block; color: #597086; font-size: 13px; }
+            .adeo-analysis-grid strong { display: block; font-size: 22px; margin-top: 6px; overflow-wrap: anywhere; }
+            .adeo-analysis-meta { margin-top: 12px; color: #597086; font-size: 12px; overflow-wrap: anywhere; }
+            .adeo-analysis-results details { margin-top: 12px; }
+            .adeo-analysis-results summary { cursor: pointer; color: #9b4331; }
+            .adeo-analysis-results ul { max-height: 220px; overflow: auto; padding-left: 24px; }
+            .adeo-analysis-brands { color: #597086; overflow-wrap: anywhere; }
+            .adeo-analysis-results .adeo-analysis-brands summary { color: #597086; }
+            .adeo-analysis-brands p { margin: 8px 0 0; }
+            .adeo-relevance-drop { position: fixed; inset: 0; z-index: 10000; display: flex; align-items: center; justify-content: center; padding: 24px; background: #eaf2fcf2; outline: 3px dashed #3274b5; outline-offset: -16px; color: #244d7a; font: bold 24px/1.5 Arial, sans-serif; text-align: center; pointer-events: none; }
+            @keyframes adeo-relevance-wait { from { transform: translateX(-100%); } to { transform: translateX(460%); } }
+            @media (prefers-reduced-motion: reduce) { .adeo-relevance-track.adeo-indeterminate .adeo-relevance-fill { animation: none; } }
+            @media (max-width: 600px) { .adeo-relevance-bar { padding: 12px; } .adeo-relevance .adeo-file-card { padding: 16px; } }
+        `;
+        document.head.append(style);
+        document.body.classList.add('adeo-relevance');
+    }
+
+    function enhancePriceRelevance() {
+        const form = document.querySelector('#price-form');
+        const input = form?.querySelector('input[type=file][name=price]');
+        const submit = form?.querySelector('#submitButton');
+        const status = document.querySelector('#status');
+        if (!form || !input || !submit || !status || form.dataset.adeoRelevance) return;
+        form.dataset.adeoRelevance = 'true';
+        installRelevanceStyles();
+        const element = (tag, className, text = '') => {
+            const node = document.createElement(tag); node.className = className; node.textContent = text; return node;
+        };
+        const settings = element('div', 'adeo-relevance-settings');
+        settings.id = 'adeo-relevance-settings'; settings.hidden = true;
+        // Перемещаем исходные поля вместе с обёртками iCheck и обработчиками сайта.
+        const fileGroup = input.closest('.form-group');
+        input.hidden = true;
+        const card = element('div', 'adeo-file-card');
+        const info = element('div', 'adeo-file-info');
+        const fileName = element('div', 'adeo-file-name', 'Выберите прайс для анализа');
+        const fileHint = element('div', 'adeo-file-hint', 'XLS или XLSX · Можно перетащить файл в любое место страницы');
+        info.append(fileName, fileHint);
+        const choose = createButton('Выбрать файл', () => input.click(), 'adeo-file-choose');
+        const remove = createButton('Убрать', () => { input.value = ''; input.dispatchEvent(new Event('change', { bubbles: true })); }, 'adeo-file-remove');
+        card.append(input, choose, info, remove);
+        fileGroup?.remove();
+        const tools = element('div', 'adeo-relevance-tools');
+        const toggle = createButton('Настройки', () => {
+            settings.hidden = !settings.hidden;
+            toggle.setAttribute('aria-expanded', String(!settings.hidden));
+        }, 'adeo-relevance-toggle');
+        toggle.setAttribute('aria-controls', settings.id); toggle.setAttribute('aria-expanded', 'false');
+        tools.append(submit, toggle);
+        settings.append(...Array.from(form.children));
+        settings.querySelectorAll('input[name]').forEach(field => {
+            if (!field.id) field.id = `adeo-relevance-${field.name}`;
+            const label = field.closest('.form-group')?.querySelector('label');
+            if (label) label.htmlFor = field.id;
+        });
+        const error = element('p', 'adeo-file-error'); error.setAttribute('role', 'alert'); error.hidden = true;
+        form.append(card, error, tools, settings);
+        const overlay = element('div', 'adeo-relevance-drop', 'Отпустите один файл XLS или XLSX для выбора');
+        overlay.hidden = true; document.body.append(overlay);
+
+        const bar = element('section', 'adeo-relevance-bar');
+        bar.setAttribute('aria-label', 'Ход анализа прайса');
+        const head = element('div', 'adeo-relevance-head');
+        const title = element('div', 'adeo-relevance-title'); title.setAttribute('role', 'status');
+        const time = element('div', 'adeo-relevance-time'); head.append(title, time);
+        const steps = element('div', 'adeo-relevance-steps');
+        ['Отправка файла', 'Ожидание', 'Обработка строк', 'Подготовка файла', 'Анализ Excel', 'Готово'].forEach((text, i) => steps.append(element('span', '', `${i + 1}. ${text}`)));
+        const track = element('div', 'adeo-relevance-track'); track.setAttribute('role', 'progressbar');
+        track.setAttribute('aria-label', 'Прогресс текущего этапа'); track.setAttribute('aria-valuemin', '0'); track.setAttribute('aria-valuemax', '100');
+        const fill = element('div', 'adeo-relevance-fill'); track.append(fill);
+        const message = element('div', 'adeo-relevance-message');
+        const warning = element('div', 'adeo-relevance-warning'); warning.setAttribute('role', 'status');
+        const links = element('div', 'adeo-relevance-links');
+        const actions = element('div', 'adeo-analysis-actions');
+        const analyze = createButton('Проанализировать прошлый результат', () => void startRelevanceAnalysis(), 'adeo-analysis-start');
+        const cancel = createButton('Остановить анализ', () => stopRelevanceAnalysis('Анализ остановлен. Excel можно скачать или проанализировать повторно.'), 'adeo-analysis-cancel');
+        actions.append(analyze, cancel);
+        const resultActions = element('div', 'adeo-result-actions'); resultActions.append(links, actions);
+        const results = element('div', 'adeo-analysis-results'); results.hidden = true;
+        bar.append(head, steps, track, message, warning, resultActions, results); tools.after(bar);
+        const originalStatusBox = status.closest('.container-fluid');
+        if (originalStatusBox && !originalStatusBox.contains(form)) originalStatusBox.hidden = true;
+        else status.hidden = true;
+
+        const state = relevanceProgress;
+        function showError(text) { error.textContent = text; error.hidden = !text; }
+        function validFile(file) { return file && /\.(xlsx|xls)$/i.test(file.name) && file.size > 0; }
+        function updateFile() {
+            const file = input.files[0];
+            fileName.textContent = file?.name || 'Выберите прайс для анализа';
+            fileHint.textContent = file ? `${new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 }).format(file.size / 1024)} КБ · XLS или XLSX` : 'XLS или XLSX · Можно перетащить файл в любое место страницы';
+            remove.hidden = !file;
+            choose.textContent = file ? 'Заменить файл' : 'Выбрать файл';
+            showError(file && !validFile(file) ? 'Нужен непустой файл в формате XLS или XLSX.' : '');
+            syncControls();
+        }
+        function syncControls() {
+            const locked = state.busy || state.uploading || relevanceAnalysisRunning();
+            const disabled = locked || !validFile(input.files[0]);
+            if (submit.disabled !== disabled) submit.disabled = disabled;
+            choose.disabled = remove.disabled = input.disabled = locked;
+        }
+        const titles = { idle: 'Готово к проверке', uploading: 'Отправка файла', queued: 'Ожидание обработки',
+            processing: 'Обработка строк', preparing: 'Подготовка результата', done: 'Файл сформирован', error: 'Ошибка проверки', unknown: 'Статус проверки' };
+        let renderedResult = null;
+        function renderResult(data) {
+            if (renderedResult === data) return;
+            renderedResult = data; results.replaceChildren(); results.hidden = !data;
+            if (!data) return;
+            const heading = element('h3', '', relevanceAnalysis.sourceName ? `Результаты анализа: ${relevanceAnalysis.sourceName}` : 'Результаты анализа предыдущего файла');
+            const grid = element('div', 'adeo-analysis-grid');
+            const integer = value => new Intl.NumberFormat('ru-RU').format(BigInt(value));
+            for (const [label, value] of [
+                ['Сумма, руб.', `${integer(data.result.rub_sum)} ₽`],
+                ['Заказали у него', integer(data.result.ordered_from_supplier)],
+                ['Всего заказ', integer(data.result.total_orders)],
+                ['Средний %', data.result.average_percent === null ? 'Нет данных' : `${data.result.average_percent.replace('.', ',')}%`],
+                ['Максимум, руб.', `${integer(data.result.maximum_rub)} ₽`]
+            ]) {
+                const article = element('article', ''); article.append(element('span', '', label), element('strong', '', value)); grid.append(article);
+            }
+            const meta = data.meta;
+            const columns = meta.detected_columns;
+            const description = element('div', 'adeo-analysis-meta', `Лист: ${meta.sheet_name} · Обработано строк: ${integer(meta.processed_rows)} · Пропущено строк: ${integer(meta.skipped_rows)} · Наличие: D · Цена: E · Заказы: ${columns.orders} · Мин. цена: ${columns.minimum_order_price}`);
+            results.append(heading, grid, description);
+            if (data.errors?.length) {
+                const brands = element('details', 'adeo-analysis-brands');
+                brands.append(element('summary', '', `Неизвестные бренды: ${integer(meta.unprocessed_brand_count)}`));
+                data.errors.forEach(item => brands.append(element('p', '', item.brands.join(', '))));
+                results.append(brands);
+            }
+            if (meta.warning_count) {
+                const details = element('details', 'adeo-analysis-warnings');
+                details.append(element('summary', '', `Предупреждений: ${integer(meta.warning_count)}${meta.warning_count > data.warnings.length ? ` · показаны первые ${data.warnings.length}` : ''}`));
+                const list = element('ul', '');
+                data.warnings.forEach(item => list.append(element('li', '', `Строка ${item.row}, ${item.field}: ${item.reason}`)));
+                details.append(list); results.append(details);
+            }
+        }
+        function render() {
+            bar.dataset.stage = state.stage;
+            const analysis = relevanceAnalysis;
+            const local = analysis.revision === state.revision && state.stage === 'done';
+            const active = local && relevanceAnalysisRunning();
+            const showAnalysis = local && analysis.phase !== 'idle';
+            const percent = showAnalysis ? analysis.percent : state.percent;
+            const oldResult = local && state.revision === 0 && analysis.phase === 'idle';
+            const percentage = percent === null ? '' : ` · ${Math.floor(percent)}%${showAnalysis || state.stage === 'processing' ? ' строк' : ' передано'}`;
+            const analysisTitles = { downloading: 'Получение Excel для анализа', loading: 'Подготовка анализа', reading: 'Чтение Excel', calculating: 'Анализ строк', done: 'Анализ завершён', error: 'Анализ не завершён' };
+            const titleText = `${showAnalysis ? analysisTitles[analysis.phase] : oldResult ? 'Предыдущий результат готов' : titles[state.stage]}${percentage}`;
+            bar.dataset.analysisPhase = analysis.phase;
+            if (title.textContent !== titleText) title.textContent = titleText;
+            message.textContent = showAnalysis ? analysis.message : oldResult ? 'Доступен результат прошлого запуска. Можно скачать или проанализировать его. Новый файл будет проанализирован автоматически после формирования.' : state.message || 'Выберите файл и нажмите «Сформировать».';
+            warning.textContent = state.warning;
+            track.hidden = !state.busy && !active;
+            track.classList.toggle('adeo-indeterminate', percent === null);
+            fill.style.width = `${percent ?? 0}%`;
+            if (percent === null) track.removeAttribute('aria-valuenow');
+            else track.setAttribute('aria-valuenow', String(Math.floor(percent)));
+            track.setAttribute('aria-valuetext', titleText);
+            const index = active ? 4 : state.stage === 'done' ? (showAnalysis && analysis.phase === 'error' ? 4 : 5) : ['uploading', 'queued', 'processing', 'preparing'].indexOf(state.stage);
+            Array.from(steps.children).forEach((step, i) => {
+                if (i === index) step.setAttribute('aria-current', 'step'); else step.removeAttribute('aria-current');
+            });
+            links.replaceChildren(...state.links.map(link => {
+                const a = element('a', '', link.text);
+                a.href = local && analysis.blobUrl && analysis.source === link.href ? analysis.blobUrl : link.href;
+                if (a.href === analysis.blobUrl) a.download = analysis.fileName;
+                return a;
+            }));
+            analyze.hidden = state.stage !== 'done' || state.busy || active || !state.links.length;
+            analyze.textContent = analysis.phase === 'idle' ? (state.revision === 0 ? 'Проанализировать прошлый результат' : 'Проанализировать результат') : 'Повторить анализ';
+            cancel.hidden = !active;
+            actions.hidden = analyze.hidden && cancel.hidden;
+            resultActions.hidden = !state.links.length && actions.hidden;
+            renderResult(local ? analysis.result : null);
+            syncControls(); updateTime();
+        }
+        function updateTime() {
+            const analysis = relevanceAnalysis;
+            const total = state.started ? `Время формирования: ${Math.floor(((state.finished ?? Date.now()) - state.started) / 1000)} с` : '';
+            const local = analysis.started && state.revision === analysis.revision ? `Анализ: ${Math.floor(((analysis.finished ?? Date.now()) - analysis.started) / 1000)} с` : '';
+            time.textContent = [total, local].filter(Boolean).join(' · ');
+        }
+        state.notify = render;
+        if (!state.message) applyRelevanceMessage(status.innerHTML, submit.disabled);
+        input.addEventListener('change', updateFile);
+        form.addEventListener('submit', event => {
+            if (state.busy || relevanceAnalysisRunning() || !validFile(input.files[0])) {
+                event.preventDefault(); event.stopImmediatePropagation();
+                if (!state.busy) showError('Выберите непустой файл XLS или XLSX.');
+            }
+        }, true);
+        // Штатный опрос может менять disabled: блокировка учитывает также локальную отправку.
+        const observer = new MutationObserver(syncControls);
+        observer.observe(submit, { attributes: true, attributeFilter: ['disabled'] });
+        let dragDepth = 0;
+        const hasFiles = event => Array.from(event.dataTransfer?.types ?? []).includes('Files');
+        document.addEventListener('dragenter', event => {
+            if (!hasFiles(event)) return;
+            event.preventDefault(); dragDepth++;
+            overlay.textContent = state.busy || relevanceAnalysisRunning() ? 'Дождитесь завершения текущей проверки' : 'Отпустите один файл XLS или XLSX для выбора';
+            overlay.hidden = false;
+        });
+        document.addEventListener('dragover', event => {
+            if (!hasFiles(event)) return;
+            event.preventDefault(); event.dataTransfer.dropEffect = state.busy || relevanceAnalysisRunning() ? 'none' : 'copy';
+        });
+        const clearDrag = () => { dragDepth = 0; overlay.hidden = true; };
+        document.addEventListener('dragleave', event => { if (hasFiles(event) && --dragDepth <= 0) clearDrag(); });
+        document.addEventListener('drop', event => {
+            if (!hasFiles(event)) return;
+            event.preventDefault(); clearDrag();
+            if (state.busy || relevanceAnalysisRunning()) return;
+            const files = event.dataTransfer.files;
+            if (files.length !== 1 || !validFile(files[0])) { showError('Перетащите один непустой файл XLS или XLSX.'); return; }
+            try {
+                input.files = files;
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+            } catch { showError('Браузер не смог принять файл. Используйте кнопку «Выбрать файл».'); }
+        });
+        window.addEventListener('blur', clearDrag);
+        document.addEventListener('dragend', clearDrag);
+        let timer = setInterval(updateTime, 1000);
+        window.addEventListener('pagehide', event => {
+            clearInterval(timer); observer.disconnect(); clearDrag();
+            if (relevanceAnalysisRunning()) stopRelevanceAnalysis('Анализ прерван при уходе со страницы. Его можно запустить повторно.');
+            if (!event.persisted && relevanceAnalysis.blobUrl) { URL.revokeObjectURL(relevanceAnalysis.blobUrl); relevanceAnalysis.blobUrl = ''; }
+        });
+        window.addEventListener('pageshow', event => {
+            if (!event.persisted) return;
+            observer.observe(submit, { attributes: true, attributeFilter: ['disabled'] });
+            timer = setInterval(updateTime, 1000); render();
+        });
+        updateFile(); render();
     }
 
     function updateTextStyle(element) {
@@ -1926,6 +2590,7 @@
     }
 
     installLoadingProgress();
+    installRelevanceProgress();
     prepareInitialCompareRequest();
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
     else {

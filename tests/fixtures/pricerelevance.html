@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<style>
+body { margin: 20px; font: 14px Arial, sans-serif; }
+.form-group { margin: 12px 0; }
+</style>
+<title>Проверка анализа прайса</title>
+<div class="container-fluid">
+    <form id="price-form" method="post" enctype="multipart/form-data">
+        <div class="container-fluid">
+            <div class="form-group"><label>Файл</label><input type="file" name="price"></div>
+            <div class="form-group"><label>Колонка артикула</label><input name="pn" value="2"></div>
+            <div class="form-group"><label>Колонка бренда</label><input name="brand" value="1"></div>
+            <div class="form-group"><label>Начать статистику с</label><input type="date" name="start_date"></div>
+            <div class="form-group"><label>Добавить колонки после</label><input name="outStart" value="6"></div>
+            <div class="form-group"><input type="checkbox" name="orders_count" checked><label>Количество заказов</label></div>
+            <div class="form-group"><input type="checkbox" name="orders_avg_cost" checked><label>Средняя цена в заказах</label></div>
+            <div class="form-group"><input type="checkbox" name="orders_min_cost" checked><label>Мин. цена в заказах</label></div>
+            <div class="form-group"><input type="checkbox" name="orders_max_cost" checked><label>Макс. цена в заказах</label></div>
+            <div class="form-group"><input type="checkbox" name="description"><label>Описание</label></div>
+        </div>
+        <input type="submit" id="submitButton" value="Сформировать">
+    </form>
+</div>
+<div class="container-fluid">Статус: <span id="status"></span></div>
+<script>
+// Воспроизводим штатную отправку и опрос без обращения к настоящему серверу.
+function refreshJobState() {
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', '/admin/admin_pricerelevance/state');
+    xhr.onload = () => {
+        if (xhr.status !== 200) return;
+        const data = JSON.parse(xhr.responseText);
+        document.querySelector('#status').innerHTML = data.message;
+        document.querySelector('#submitButton').disabled = data.inProcess;
+    };
+    xhr.send();
+}
+document.querySelector('form').addEventListener('submit', event => {
+    event.preventDefault();
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', location.pathname);
+    xhr.onload = () => { document.querySelector('#status').innerHTML = xhr.responseText; };
+    xhr.send(new FormData(document.querySelector('#price-form')));
+});
+refreshJobState();
+setInterval(refreshJobState, 5000);
+</script>
+</html>
