@@ -55,7 +55,7 @@ test('Исходный отчёт CRM совпадает с восемью по�
 });
 
 function row(id, ready = true, signature = 'initial') {
-    return `<tr data-report="${id}"><td>${ready ? 'Готов' : 'В очереди'}</td><td>20 нояб. 10:00</td><td>Прайс Cella${id}/3</td><td>${ready ? `<a download href="https://s3.adeo.pro/crm-bucket-1d/report-${id}?Signature=${signature}">Скачать</a>` : ''}</td></tr>`;
+    return `<tr data-report="${id}"><td>${ready ? 'Готов' : 'В очереди'}</td><td>20 нояб. 10:00</td><td>Прайс Cella${id}/3</td><td>${ready ? `<a download href="https://s3.adeo.pro/crm-bucket-1d/report-${id}?Signature=${signature}">Скачать</a>` : '<span class="native-cancel full-width"><button type="button" aria-label="Отменить задание">×</button></span>'}</td></tr>`;
 }
 const fixture = `<style>body{margin:0;font:14px Arial}.marketability{display:flex;flex-direction:column;height:100vh}.marketability__row{display:flex}.marketability__col{width:50%}table{border-collapse:collapse}td,th{padding:12px}button,input{font:inherit}.q-table__middle{overflow:auto}</style>
 <div class="marketability"><form><h2>Параметры генерации отчета</h2><div class="marketability__row"><div class="marketability__col">Поставщик <input aria-label="Прайс" value="CellaTEST/3"></div><div class="marketability__col">Позиции c <input aria-label="c" value="1"> до <input aria-label="до" value="998"></div></div><div class="marketability__row"><label><input type="checkbox" name="unique">Уникальные позиции</label></div><div class="full-width"><button type="submit">Добавить в очередь</button></div></form>
@@ -98,7 +98,35 @@ test('CRM: только ручной анализ, отдельные резул
         });
         const first = page.locator('[data-report="1"]'), second = page.locator('[data-report="2"]'), pending = page.locator('[data-report="3"]');
         assert.equal(requests.length, 0);
-        assert.equal(await pending.locator('button').isDisabled(), true);
+        assert.equal(await pending.locator('.adeo-marketability-launch').isDisabled(), true);
+        const actionBounds = target => target.locator('td:last-child').evaluate(cell => {
+            const native = cell.querySelector(':scope > :not(.adeo-marketability-launch)').getBoundingClientRect();
+            const analysis = cell.querySelector('.adeo-marketability-launch').getBoundingClientRect();
+            const bounds = cell.getBoundingClientRect();
+            return { left: native.left - bounds.left, right: analysis.left - bounds.left, width: analysis.width,
+                nativeCenterY: native.top + native.height / 2, analysisCenterY: analysis.top + analysis.height / 2 };
+        });
+        const pendingBounds = await actionBounds(pending);
+        assert.ok(pendingBounds.right >= pendingBounds.left + 36);
+        assert.ok(Math.abs(pendingBounds.nativeCenterY - pendingBounds.analysisCenterY) < 1);
+        await pending.locator('td:last-child').evaluate(cell => {
+            window.nativeCancels = 0;
+            cell.querySelector('.native-cancel button').addEventListener('click', () => window.nativeCancels++);
+        });
+        await pending.getByRole('button', { name: 'Отменить задание' }).click();
+        assert.equal(await page.evaluate(() => window.nativeCancels), 1);
+        // Воспроизводим патч Vue: готовая ссылка появляется ПОСЛЕ уже существующей кнопки анализа.
+        await pending.locator('td:last-child').evaluate(cell => {
+            cell.querySelector('.native-cancel').remove();
+            const link = document.createElement('a'); link.download = ''; link.textContent = '↓';
+            link.href = 'https://s3.adeo.pro/crm-bucket-1d/report-3?Signature=ready'; cell.append(link);
+        });
+        await page.waitForFunction(() => !document.querySelector('[data-report="3"] .adeo-marketability-launch').disabled);
+        const readyBounds = await actionBounds(pending);
+        assert.ok(Math.abs(readyBounds.left - pendingBounds.left) < 1);
+        assert.ok(Math.abs(readyBounds.right - pendingBounds.right) < 1);
+        assert.ok(Math.abs(readyBounds.nativeCenterY - readyBounds.analysisCenterY) < 1);
+        assert.equal(requests.length, 0, 'Переход в готовность не должен запускать анализ');
         const originalHref = await first.locator('a').getAttribute('href');
         await first.locator('button').click();
         await page.waitForFunction(() => document.querySelector('.adeo-marketability-result')?.dataset.phase === 'downloading');
@@ -121,6 +149,9 @@ test('CRM: только ручной анализ, отдельные резул
         assert.equal(requests.length, cachedRequests);
         assert.deepEqual(await page.locator('.adeo-marketability-metric strong').allTextContents(), ['2', '1', '0', '0', '10', '30,00%', '—', '—']);
         assert.equal(await first.locator('a').getAttribute('href'), originalHref);
+        const resultBounds = await actionBounds(first);
+        assert.ok(Math.abs(resultBounds.nativeCenterY - resultBounds.analysisCenterY) < 1);
+        assert.equal(resultBounds.width, readyBounds.width, 'Длина надписи не должна менять место кнопки');
         await second.locator('button').click();
         await page.waitForFunction(() => [...document.querySelectorAll('.adeo-marketability-result')].some(panel => panel.dataset.phase === 'error'));
         assert.match(await page.locator('.adeo-marketability-result[data-phase=error]').innerText(), /срок её действия истёк/);

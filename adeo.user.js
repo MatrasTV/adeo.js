@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADEO — прайсы и расписание поставщиков
 // @namespace    admin.adeo.pro
-// @version      3.6.0
+// @version      3.6.1
 // @description  Работа с прайсами и мастер расписания поставщиков CRM
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
@@ -2634,9 +2634,10 @@
             .adeo-marketability .q-table > tbody > tr:not(.adeo-marketability-detail) > td { padding: 12px; white-space: normal; vertical-align: middle; border-bottom: 1px solid var(--ap-borders-color, #e1e7ed); }
             .adeo-marketability .q-table > tbody > tr:not(.adeo-marketability-detail):hover > td { background: var(--ap-hover-background-color, #f4f7fb); }
             .adeo-marketability .q-table thead th:last-child { width: 200px; text-align: center; }
-            .adeo-marketability .q-table td.adeo-marketability-report { white-space: nowrap !important; width: 200px; min-width: 175px; text-align: center; }
-            .adeo-marketability-report > a[download] { display: inline-flex !important; width: auto !important; min-width: 36px; min-height: 36px; vertical-align: middle; margin-right: 8px; }
-            .adeo-marketability-report > button { vertical-align: middle; }
+            .adeo-marketability .q-table td.adeo-marketability-report { position: relative; white-space: nowrap !important; width: 200px; min-width: 175px; height: 64px; text-align: center; }
+            /* CRM может вставить ссылку после нашей кнопки: места действий не зависят от порядка узлов Vue. */
+            .adeo-marketability .adeo-marketability-report > :not(.adeo-marketability-launch) { position: absolute !important; top: 50%; left: calc(50% - 70px); transform: translateY(-50%); display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box; width: 36px !important; height: 36px; min-width: 36px; margin: 0 !important; }
+            .adeo-marketability .adeo-marketability-report > button.adeo-marketability-launch { position: absolute; top: 50%; left: calc(50% - 26px); transform: translateY(-50%); box-sizing: border-box; width: 96px; height: 36px; margin: 0; }
             .adeo-marketability button.adeo-marketability-button { box-sizing: border-box; min-height: 36px; padding: 6px 12px; border: 1px solid #b7c9da; border-radius: 5px; background: #fff; color: #245d8d; font: 14px/1.4 Arial, sans-serif; cursor: pointer; white-space: nowrap; }
             .adeo-marketability button.adeo-marketability-button:hover:not(:disabled) { background: #eaf2fb; border-color: #7a9fbe; }
             .adeo-marketability button.adeo-marketability-button:focus-visible { outline: 2px solid #3274b5; outline-offset: 2px; }
