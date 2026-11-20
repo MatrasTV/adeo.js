@@ -58,9 +58,13 @@ test('Первичная загрузка отправляет один запр
                 window.monitoredSend = XMLHttpRequest.prototype.send;`
         );
         await page.addInitScript({ content: `window.originalOpen = XMLHttpRequest.prototype.open;
-            window.originalSend = XMLHttpRequest.prototype.send;\n${source}` });
+            window.originalSend = XMLHttpRequest.prototype.send;
+            window.menuCommands = [];
+            window.GM_registerMenuCommand = (title, callback) => window.menuCommands.push({ title, callback });
+            window.GM_openInTab = () => {};\n${source}` });
         await page.goto(endpoint);
         await page.waitForFunction(() => window.responses === 3);
+        assert.equal(await page.evaluate(() => window.menuCommands.length), 5, 'Меню должно работать одновременно с ранней подготовкой запроса');
         let mainRequests = requests.filter(request => request.url === endpoint);
         assert.equal(mainRequests.length, 1, 'При старте должен отправляться только один запрос таблицы');
         const initial = new URLSearchParams(mainRequests[0].body);

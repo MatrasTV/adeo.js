@@ -5,7 +5,7 @@ const { resolve } = require('node:path');
 const root = resolve(__dirname, '..');
 const target = resolve(root, 'adeo.user.js');
 const libraries = [
-    ['assets/vendor/SheetJS-LICENSE.txt', 'assets/vendor/xlsx-0.20.3.js'],
+    ['assets/vendor/SheetJS-LICENSE.txt', 'assets/vendor/xlsx-mini-0.20.3.js'],
     ['assets/vendor/decimal-LICENCE.md', 'assets/vendor/decimal-10.6.0.js']
 ];
 const sources = libraries.map(([license, script]) => {

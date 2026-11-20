@@ -5,7 +5,7 @@ const { resolve, basename } = require('node:path');
 const vm = require('node:vm');
 
 const source = readFileSync(resolve(__dirname, '../adeo.user.js'), 'utf8');
-const xlsxPath = process.env.ADEO_XLSX_LIBRARY || resolve(__dirname, '../assets/vendor/xlsx-0.20.3.js');
+const xlsxPath = process.env.ADEO_XLSX_LIBRARY || resolve(__dirname, '../assets/vendor/xlsx-mini-0.20.3.js');
 const decimalPath = process.env.ADEO_DECIMAL_LIBRARY || resolve(__dirname, '../assets/vendor/decimal-10.6.0.js');
 const librariesAvailable = xlsxPath && decimalPath && existsSync(xlsxPath) && existsSync(decimalPath);
 let XLSX, Decimal, chromium;

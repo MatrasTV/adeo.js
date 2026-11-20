@@ -4,10 +4,10 @@
 
 | Файл | Версия | Исходный адрес | Лицензия |
 | --- | --- | --- | --- |
-| `xlsx-0.20.3.js` | SheetJS 0.20.3 | https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js | `SheetJS-LICENSE.txt`, Apache-2.0 |
+| `xlsx-mini-0.20.3.js` | SheetJS mini 0.20.3 | https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.mini.min.js | `SheetJS-LICENSE.txt`, Apache-2.0 |
 | `decimal-10.6.0.js` | decimal.js 10.6.0 | https://cdn.jsdelivr.net/npm/decimal.js@10.6.0/decimal.js | `decimal-LICENCE.md`, MIT |
 
-Исходники библиотек сохранены без изменений. После обновления файлов выполните из корня проекта:
+Исходники библиотек сохранены без изменений. Облегчённая сборка SheetJS читает отчёты XLSX, выдаваемые системой; поддержка старых готовых отчётов XLS исключена. Возможность загрузить исходный XLS на сервер ADEO сохраняется: его обработку выполняет сам сервер, а браузер анализирует готовый XLSX. После обновления файлов выполните из корня проекта:
 
 ```powershell
 node scripts/bundle-analysis.cjs
