@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADEO — прайсы и расписание поставщиков
 // @namespace    admin.adeo.pro
-// @version      3.5.1
+// @version      3.6.0
 // @description  Работа с прайсами и мастер расписания поставщиков CRM
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
@@ -2550,6 +2550,350 @@
         if (overlay.isConnected) render();
     }
 
+    // Расчёт конкурентоспособности повторяет O1:V2 макроса, не меняя исходную книгу.
+    function calculateMarketabilityWorkbook(workbook, XLSX, Decimal, progress = () => {}) {
+        const normalize = value => String(value ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+        let structure = null;
+        for (const name of workbook.SheetNames) {
+            const sheet = workbook.Sheets[name];
+            if (!sheet?.['!ref']) continue;
+            const end = XLSX.utils.decode_range(sheet['!ref']).e;
+            for (let row = 0; row <= Math.min(9, end.r); row++) {
+                const headers = new Map();
+                for (let col = 0; col <= end.c; col++) {
+                    const header = normalize(sheet[XLSX.utils.encode_cell({ r: row, c: col })]?.v);
+                    if (header) headers.set(header, col);
+                }
+                if (headers.has('позиция') && headers.has('артикул') && headers.has('бренд')) {
+                    structure = { sheet, name, header: row, end: end.r, position: headers.get('позиция'), article: headers.get('артикул') };
+                    break;
+                }
+            }
+            if (structure) break;
+        }
+        if (!structure) throw new Error('Не найдена таблица с колонками «Позиция», «Артикул» и «Бренд». Нужен исходный отчёт конкурентоспособности CRM.');
+        const value = (row, col) => structure.sheet[XLSX.utils.encode_cell({ r: row, c: col })]?.v;
+        let top1 = 0, unique = 0, top2 = 0, top3 = 0, total = 0, invalid = 0, uniqueSection = false;
+        const warnings = [];
+        const rows = structure.end - structure.header;
+        for (let row = structure.header + 1; row <= structure.end; row++) {
+            const processed = row - structure.header;
+            if (processed === 1 || processed % 1000 === 0 || processed === rows) progress(processed, rows);
+            const raw = value(row, structure.position);
+            const positionText = normalize(raw);
+            if (positionText === 'уникальные позиции') { uniqueSection = true; continue; }
+            const article = value(row, structure.article);
+            if (!positionText && (article === undefined || article === null || article === '')) continue;
+            // Числовая позиция — запись отчёта; неизвестный ранг со SKU учитываем в знаменателе с замечанием.
+            const rank = positionText && typeof raw !== 'boolean' ? Number(positionText.replace(',', '.')) : NaN;
+            if (!Number.isInteger(rank) || rank < 1 || rank > 999) {
+                if (article === undefined || article === null || article === '') continue;
+                total++; invalid++;
+                if (warnings.length < 100) warnings.push(`Строка ${row + 1}: не удалось определить позицию. Строка включена в общее количество, но не в топ.`);
+                continue;
+            }
+            total++;
+            if (uniqueSection || rank === 999) unique++;
+            else if (rank === 1) top1++;
+            else if (rank === 2) top2++;
+            else if (rank === 3) top3++;
+        }
+        if (!total) throw new Error('В отчёте не найдены позиции для анализа.');
+        const passed = top1 + unique;
+        // Целевой порог — ровно 30%. Целочисленная разница исключает ошибки округления на границе.
+        const gap = 3 * total - 10 * passed;
+        const percent = new Decimal(passed).div(total).times(100).toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2);
+        return { result: { top1, unique, top2, top3, total, percent, passed, target: 30, meetsTarget: gap <= 0,
+            discountRows: gap > 0 ? Math.ceil(gap / 10) : null, removeRows: gap > 0 ? Math.ceil(gap / 3) : null },
+            meta: { sheet: structure.name, invalidRows: invalid, scannedRows: rows }, warnings };
+    }
+
+    function installMarketabilityStyles() {
+        if (document.getElementById('adeo-marketability-styles')) return;
+        const style = document.createElement('style'); style.id = 'adeo-marketability-styles';
+        style.textContent = `
+            .adeo-marketability.marketability { max-width: none; width: 100%; padding: 20px; gap: 18px; overflow-y: auto; box-sizing: border-box; }
+            .adeo-marketability > form { display: grid !important; width: 100%; max-width: 1200px; margin: 0 auto; box-sizing: border-box; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; flex: 0 0 auto; padding: 16px 20px; border: 1px solid var(--ap-borders-color, #d8e0e8); border-radius: 10px; background: var(--ap-background-color, #fff); gap: 10px 24px !important; }
+            .adeo-marketability > form > :not(.marketability__row) { grid-column: 1 / -1; }
+            .adeo-marketability .marketability__row { display: grid; grid-template-columns: 145px minmax(0, 1fr); align-items: center; align-content: center; min-height: 40px; gap: 12px; padding: 2px 0; }
+            .adeo-marketability .marketability__col { flex: initial; width: auto; min-width: 0; align-items: center; gap: 10px; }
+            .adeo-marketability .marketability__col:last-child { flex-wrap: wrap; }
+            .adeo-marketability .marketability__row > .crm-switch:only-child { grid-column: 1 / -1; }
+            .adeo-marketability .marketability__row > .crm-switch { max-width: 100%; }
+            .adeo-marketability .crm-switch__button { flex-shrink: 0; }
+            .adeo-marketability .crm-switch > .crm-input-sm { white-space: normal; line-height: 1.5; }
+            .adeo-marketability form .q-field { max-width: 100%; }
+            .adeo-marketability form > .full-width { padding-top: 12px; border-top: 1px solid var(--ap-borders-color, #d8e0e8); }
+            .adeo-marketability form button[type=submit] { min-height: 38px; border-radius: 6px; }
+            .adeo-marketability .marketability__log { width: 100%; max-width: 1200px; box-sizing: border-box; margin: 0 auto; padding: 16px; border: 1px solid var(--ap-borders-color, #d8e0e8); border-radius: 10px; background: var(--ap-background-color, #fff); flex: 0 0 auto; min-width: 0; overflow: visible; }
+            .adeo-marketability .q-table__top { padding-bottom: 12px; gap: 8px; }
+            .adeo-marketability .q-table__title { font-size: 17px; font-weight: 600; }
+            .adeo-marketability .q-table__middle { max-height: 65vh; overflow: auto; }
+            .adeo-marketability table.q-table { width: 100%; }
+            .adeo-marketability .q-table th { background: var(--ap-background-color, #fff); padding: 10px 12px; }
+            .adeo-marketability .q-table > tbody > tr:not(.adeo-marketability-detail) > td { padding: 12px; white-space: normal; vertical-align: middle; border-bottom: 1px solid var(--ap-borders-color, #e1e7ed); }
+            .adeo-marketability .q-table > tbody > tr:not(.adeo-marketability-detail):hover > td { background: var(--ap-hover-background-color, #f4f7fb); }
+            .adeo-marketability .q-table thead th:last-child { width: 200px; text-align: center; }
+            .adeo-marketability .q-table td.adeo-marketability-report { white-space: nowrap !important; width: 200px; min-width: 175px; text-align: center; }
+            .adeo-marketability-report > a[download] { display: inline-flex !important; width: auto !important; min-width: 36px; min-height: 36px; vertical-align: middle; margin-right: 8px; }
+            .adeo-marketability-report > button { vertical-align: middle; }
+            .adeo-marketability button.adeo-marketability-button { box-sizing: border-box; min-height: 36px; padding: 6px 12px; border: 1px solid #b7c9da; border-radius: 5px; background: #fff; color: #245d8d; font: 14px/1.4 Arial, sans-serif; cursor: pointer; white-space: nowrap; }
+            .adeo-marketability button.adeo-marketability-button:hover:not(:disabled) { background: #eaf2fb; border-color: #7a9fbe; }
+            .adeo-marketability button.adeo-marketability-button:focus-visible { outline: 2px solid #3274b5; outline-offset: 2px; }
+            .adeo-marketability button.adeo-marketability-button:disabled { opacity: .5; cursor: default; }
+            .adeo-marketability-detail > td { padding: 0 0 14px !important; border: 0; white-space: normal !important; height: auto !important; }
+            .adeo-marketability-result { padding: 16px; background: #f5f8fc; border: 1px solid #d8e3ef; border-radius: 8px; color: #26394d; font: 14px/1.5 Arial, sans-serif; min-width: 0; }
+            .adeo-marketability-result[data-phase=error] { border-color: #dfb9b3; }
+            .adeo-marketability-heading, .adeo-marketability-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; }
+            .adeo-marketability-heading { justify-content: space-between; }
+            .adeo-marketability-result h3 { font: bold 16px/1.5 Arial, sans-serif; margin: 0; }
+            .adeo-marketability-caption { color: #597086; margin: 4px 0 10px; overflow-wrap: anywhere; }
+            .adeo-marketability-time { color: #597086; font-size: 12px; }
+            .adeo-marketability-status { margin: 6px 0; }
+            .adeo-marketability-result[data-phase=error] .adeo-marketability-status { color: #963c36; }
+            .adeo-marketability-progress { display: block; width: 100%; height: 8px; margin: 8px 0 12px; accent-color: #3274b5; }
+            .adeo-marketability-controls { margin-top: 12px; }
+            .adeo-marketability-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+            .adeo-marketability-metric { background: #fff; border: 1px solid #d8e0e8; border-radius: 6px; padding: 12px; min-width: 0; }
+            .adeo-marketability-metric span { display: block; color: #597086; }
+            .adeo-marketability-metric strong { display: block; margin-top: 5px; font-size: 22px; overflow-wrap: anywhere; }
+            .adeo-marketability-metric[data-target=met] { background: #edf8f1; border-color: #a8cbb6; }
+            .adeo-marketability-metric[data-target=below] { background: #fff9ed; border-color: #e4d5af; }
+            .adeo-marketability-note { margin-top: 12px; color: #597086; font-size: 12px; }
+            .adeo-marketability-result details { margin-top: 10px; }
+            .adeo-marketability-result summary { cursor: pointer; color: #8b6334; }
+            .adeo-marketability-result ul { max-height: 180px; overflow: auto; padding-left: 22px; }
+            .adeo-marketability [hidden] { display: none !important; }
+            @media (min-width: 1101px) {
+                .adeo-marketability > form > .marketability__row:has(input[aria-label="Прайс"]) { grid-column: 1; grid-row: 2; }
+                .adeo-marketability > form > .marketability__row:has(input[aria-label="c"]) { grid-column: 1; grid-row: 3; }
+                .adeo-marketability > form > .marketability__row:has(input[aria-label="ID"]) { grid-column: 1; grid-row: 4; }
+                .adeo-marketability > form > .marketability__row:has(.crm-switch[aria-label^="Уникальные позиции"]) { grid-column: 2; grid-row: 2; }
+                .adeo-marketability > form > .marketability__row:has(.crm-switch[aria-label^="Включать в анализ прайсы заграничных"]) { grid-column: 2; grid-row: 3; }
+                .adeo-marketability > form > .marketability__row:has(.crm-switch[aria-label^="Включить в отчет только детали"]) { grid-column: 2; grid-row: 4; grid-template-columns: minmax(0, 1fr) 248px; }
+                .adeo-marketability > form > .marketability__row:has(.crm-switch[aria-label^="Добавить наценку"]) { grid-column: 2; grid-row: 5; grid-template-columns: minmax(0, 1fr) 248px; }
+            }
+            @media (max-width: 1100px) { .adeo-marketability > form { grid-template-columns: minmax(0, 1fr); } }
+            @media (max-width: 760px) { .adeo-marketability.marketability { padding: 10px; } .adeo-marketability > form, .adeo-marketability .marketability__log { padding: 12px; } .adeo-marketability .marketability__row { grid-template-columns: minmax(0, 1fr); gap: 8px; } .adeo-marketability-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .adeo-marketability-result { padding: 12px; } }
+        `;
+        document.head.append(style);
+    }
+
+    function initMarketability() {
+        const records = new Map();
+        const bindings = new WeakMap();
+        let sequence = 0, frame = null, timer = null;
+        const active = record => ['downloading', 'loading', 'reading', 'calculating'].includes(record.phase);
+        const element = (tag, className, text = '') => { const node = document.createElement(tag); node.className = className; node.textContent = text; return node; };
+        function stop(record, message) {
+            record.token++;
+            record.controller?.abort(); record.controller = null;
+            record.worker?.terminate(); record.worker = null;
+            clearTimeout(record.timeout); record.timeout = null;
+            if (message) { record.phase = 'error'; record.message = message; record.percent = null; record.finished = Date.now(); }
+        }
+        function updateTime(record) {
+            if (record.time) record.time.textContent = record.started ? `Время анализа: ${Math.floor(((record.finished ?? Date.now()) - record.started) / 1000)} с` : '';
+        }
+        function render(record) {
+            if (!record.panel) return;
+            record.detail.hidden = !record.expanded;
+            record.panel.dataset.phase = record.phase;
+            record.status.textContent = record.message;
+            record.progress.hidden = !active(record);
+            if (record.percent === null) record.progress.removeAttribute('value');
+            else record.progress.value = record.percent;
+            record.retry.hidden = active(record);
+            record.cancel.hidden = !active(record);
+            record.metrics.hidden = !record.result;
+            if (record.rendered !== record.result) {
+                record.rendered = record.result; record.metrics.replaceChildren(); record.notes.replaceChildren();
+                if (record.result) {
+                    const data = record.result.result;
+                    const integer = value => new Intl.NumberFormat('ru-RU').format(value);
+                    const items = [['Топ 1', integer(data.top1)], ['Уник', integer(data.unique)], ['Топ 2', integer(data.top2)], ['Топ 3', integer(data.top3)],
+                        ['Всего строк?', integer(data.total)], ['% прохождения', `${data.percent.replace('.', ',')}%`],
+                        ['Скидка строк', data.discountRows === null ? '—' : integer(data.discountRows)], ['Убрать строк', data.removeRows === null ? '—' : integer(data.removeRows)]];
+                    items.forEach(([label, value], index) => {
+                        const metric = element('article', 'adeo-marketability-metric'); metric.append(element('span', '', label), element('strong', '', value));
+                        if (index === 5) metric.dataset.target = data.meetsTarget ? 'met' : 'below';
+                        if (index === 6) metric.title = 'Сколько позиций нужно улучшить до топ-1, чтобы достичь 30% прохождения.';
+                        if (index === 7) metric.title = 'Сколько непроходящих позиций нужно исключить, чтобы достичь 30% прохождения.';
+                        record.metrics.append(metric);
+                    });
+                    record.notes.append(element('div', 'adeo-marketability-note', `Цель: 30%. Прохождение = (Топ 1 + Уник) / Всего строк. ${data.meetsTarget ? 'Целевой порог достигнут.' : '«Скидка строк» и «Убрать строк» — альтернативные способы достичь цели.'} Уникальные позиции не включены повторно в Топ 1. Лист: ${record.result.meta.sheet}.`));
+                    if (record.result.warnings.length) {
+                        const details = element('details', ''); details.append(element('summary', '', `Замечания к позициям: ${integer(record.result.meta.invalidRows)}`));
+                        const list = element('ul', ''); record.result.warnings.forEach(text => list.append(element('li', '', text))); details.append(list); record.notes.append(details);
+                    }
+                }
+            }
+            updateTime(record);
+        }
+        function mount(record, row) {
+            if (!record.detail) {
+                const detail = element('tr', 'adeo-marketability-detail q-virtual-scroll--with-prev');
+                const cell = element('td', ''); const panel = element('section', 'adeo-marketability-result');
+                panel.id = `adeo-marketability-result-${++sequence}`; panel.setAttribute('aria-label', 'Анализ конкурентоспособности отчёта');
+                const heading = element('div', 'adeo-marketability-heading');
+                record.time = element('span', 'adeo-marketability-time'); heading.append(element('h3', '', 'Анализ отчёта'), record.time);
+                record.caption = element('div', 'adeo-marketability-caption');
+                record.status = element('div', 'adeo-marketability-status'); record.status.setAttribute('role', 'status');
+                record.progress = element('progress', 'adeo-marketability-progress'); record.progress.max = 100; record.progress.setAttribute('aria-label', 'Прогресс текущего этапа анализа');
+                record.metrics = element('div', 'adeo-marketability-metrics'); record.notes = element('div', '');
+                const controls = element('div', 'adeo-marketability-controls');
+                record.retry = createButton('Повторить анализ', () => void start(record), 'adeo-marketability-button');
+                record.cancel = createButton('Остановить анализ', () => { stop(record, 'Анализ остановлен. Исходный отчёт доступен для скачивания.'); render(record); schedule(); }, 'adeo-marketability-button');
+                const close = createButton('Свернуть', () => { record.expanded = false; render(record); schedule(); refreshScroll(row); }, 'adeo-marketability-button');
+                controls.append(record.retry, record.cancel, close);
+                panel.append(heading, record.caption, record.status, record.progress, record.metrics, record.notes, controls);
+                cell.append(panel); detail.append(cell); record.detail = detail; record.panel = panel;
+            }
+            record.detail.firstElementChild.colSpan = row.children.length;
+            record.caption.textContent = record.label;
+            if (row.nextElementSibling !== record.detail) row.after(record.detail);
+            render(record);
+        }
+        function refreshScroll(row) {
+            // Дополнительная строка учитывается виртуальной таблицей вместе с исходной записью.
+            requestAnimationFrame(() => row.closest('.q-table__middle')?.dispatchEvent(new Event('scroll')));
+        }
+        async function start(record) {
+            if (active(record) || Array.from(records.values()).some(other => other !== record && active(other))) return;
+            stop(record);
+            const token = record.token;
+            Object.assign(record, { phase: 'downloading', message: 'Получение исходного Excel…', percent: null, result: null,
+                expanded: true, started: Date.now(), finished: null });
+            const current = () => token === record.token;
+            const fail = message => { if (current()) { stop(record, message); render(record); schedule(); } };
+            render(record); schedule();
+            try {
+                let buffer;
+                if (record.blob) buffer = await record.blob.arrayBuffer();
+                else {
+                    record.controller = new AbortController();
+                    record.timeout = setTimeout(() => fail('Сервер слишком долго передаёт отчёт. Обновите очередь и повторите анализ.'), 90000);
+                    const url = new URL(record.href);
+                    const response = await fetch(url.href, { credentials: url.origin === window.location.origin ? 'same-origin' : 'omit', cache: 'no-store', signal: record.controller.signal });
+                    if (!current()) return;
+                    if (!response.ok) throw new Error([401, 403, 404].includes(response.status) ? 'Ссылка на отчёт недоступна или срок её действия истёк. Обновите очередь штатной кнопкой и нажмите «Анализ» снова.' : `Не удалось получить отчёт: HTTP ${response.status}.`);
+                    const limit = 50 * 1024 * 1024, total = Number(response.headers.get('content-length'));
+                    if (total > limit) throw new Error('Отчёт больше 50 МБ. Используйте скачивание исходного файла.');
+                    const reader = response.body.getReader(), chunks = []; let length = 0, lastUpdate = 0;
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (!current()) { await reader.cancel(); return; }
+                        if (done) break;
+                        length += value.byteLength;
+                        if (length > limit) { await reader.cancel(); throw new Error('Отчёт больше 50 МБ. Используйте скачивание исходного файла.'); }
+                        chunks.push(value);
+                        if (Date.now() - lastUpdate > 150) {
+                            lastUpdate = Date.now(); record.percent = total > 0 ? Math.min(100, length / total * 100) : null;
+                            record.message = `Получение исходного Excel… ${new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 }).format(length / 1048576)} МБ`; render(record);
+                        }
+                    }
+                    const bytes = new Uint8Array(length); let offset = 0;
+                    chunks.forEach(chunk => { bytes.set(chunk, offset); offset += chunk.length; });
+                    if (bytes[0] !== 0x50 || bytes[1] !== 0x4b) throw new Error('Сервер вернул не Excel-файл. Обновите очередь отчётов и повторите анализ.');
+                    buffer = bytes.buffer; record.blob = new Blob([buffer]);
+                    // Храним не более двух последних исходников; раскрытые результаты сохраняются отдельно.
+                    const cached = Array.from(records.values()).filter(other => other !== record && other.blob).sort((a, b) => b.started - a.started);
+                    cached.slice(1).forEach(other => { other.blob = null; });
+                }
+                if (!current()) return;
+                clearTimeout(record.timeout); record.controller = null;
+                record.phase = 'loading'; record.percent = null; record.message = 'Подготовка анализа…'; render(record);
+                const source = URL.createObjectURL(new Blob([getRelevanceWorkerSources(), '\n;\n',
+                    `(${relevanceAnalysisWorker.toString()})(${calculateMarketabilityWorkbook.toString()});`], { type: 'application/javascript' }));
+                try { record.worker = new Worker(source); }
+                catch { throw new Error('Браузер не разрешил фоновый анализ. Исходный файл можно скачать штатной кнопкой.'); }
+                finally { URL.revokeObjectURL(source); }
+                record.worker.onerror = event => { event.preventDefault(); fail('Не удалось запустить анализ. Обновите страницу и повторите попытку.'); };
+                record.worker.onmessage = event => {
+                    if (!current()) return;
+                    Object.assign(record, event.data, { percent: event.data.percent ?? null });
+                    if (['done', 'error'].includes(record.phase)) {
+                        record.finished = Date.now(); clearTimeout(record.timeout); record.timeout = null;
+                        record.worker.terminate(); record.worker = null; schedule(); refreshScroll(record.row);
+                        const button = bindings.get(record.row)?.button;
+                        if (record.expanded && (document.activeElement === button || record.panel.contains(document.activeElement))) {
+                            requestAnimationFrame(() => record.panel.scrollIntoView({ block: 'nearest' }));
+                        }
+                    }
+                    render(record);
+                };
+                record.timeout = setTimeout(() => fail('Анализ остановлен: превышено время ожидания 5 минут. Можно повторить анализ или скачать исходный отчёт.'), 300000);
+                record.worker.postMessage({ buffer }, [buffer]);
+            } catch (error) { fail(error.name === 'TypeError' ? 'Не удалось прочитать отчёт из хранилища. Проверьте соединение, обновите очередь и повторите анализ.' : error.message || 'Не удалось выполнить анализ.'); }
+        }
+        function clear() {
+            records.forEach(record => { stop(record); record.detail?.remove(); record.blob = null; }); records.clear();
+        }
+        function update() {
+            frame = null;
+            if (!/^\/reports\/marketability\/?$/.test(window.location.pathname)) { clear(); return; }
+            const root = document.querySelector('.marketability'); if (!root) return;
+            root.classList.add('adeo-marketability'); installMarketabilityStyles();
+            const busy = Array.from(records.values()).some(active);
+            const visible = new Set();
+            root.querySelectorAll('.marketability__log table.q-table > tbody > tr:not(.adeo-marketability-detail)').forEach(row => {
+                if (row.children.length < 4 || row.closest('tbody')?.getAttribute('aria-hidden') === 'true') return;
+                const cell = row.lastElementChild; cell.classList.add('adeo-marketability-report');
+                const link = cell.querySelector('a[download][href]');
+                let key = null;
+                try { const url = new URL(link?.getAttribute('href'), window.location.href); if (link && url.protocol === 'https:') key = url.origin + url.pathname; } catch { /* У задания без готовой ссылки анализ пока недоступен. */ }
+                let binding = bindings.get(row);
+                if (!binding || !cell.contains(binding.button)) {
+                    cell.querySelectorAll('.adeo-marketability-launch').forEach(button => button.remove());
+                    const button = createButton('Анализ', () => {
+                        const bound = bindings.get(row), record = records.get(bound?.key); if (!record) return;
+                        record.expanded = !record.expanded;
+                        mount(record, row); refreshScroll(row);
+                        if (record.phase === 'idle') { record.expanded = true; void start(record); }
+                        if (record.expanded) requestAnimationFrame(() => record.panel.scrollIntoView({ block: 'nearest' }));
+                        schedule();
+                    }, 'adeo-marketability-button adeo-marketability-launch');
+                    binding = { key: null, button }; bindings.set(row, binding); cell.append(button);
+                }
+                if (binding.key && binding.key !== key) records.get(binding.key)?.detail?.remove();
+                binding.key = key;
+                if (!key) { binding.button.disabled = true; if (binding.button.textContent !== 'Анализ') binding.button.textContent = 'Анализ'; binding.button.title = 'Анализ доступен после готовности отчёта'; binding.button.removeAttribute('aria-controls'); binding.button.setAttribute('aria-expanded', 'false'); return; }
+                let record = records.get(key);
+                if (!record) {
+                    record = { key, token: 0, phase: 'idle', percent: null, message: '', result: null, expanded: false, started: null, finished: null, blob: null };
+                    records.set(key, record);
+                }
+                visible.add(record); record.href = link.href; record.row = row;
+                record.label = [row.children[1].textContent.trim(), row.children[2].textContent.trim()].filter(Boolean).join(' · ');
+                if (record.detail) mount(record, row);
+                const text = record.phase === 'idle' ? 'Анализ' : record.expanded ? 'Свернуть' : 'Результат';
+                if (binding.button.textContent !== text) binding.button.textContent = text;
+                binding.button.disabled = busy && record.phase === 'idle';
+                binding.button.title = busy && record.phase === 'idle' ? 'Дождитесь завершения текущего анализа' : 'Показать анализ этого отчёта';
+                binding.button.setAttribute('aria-expanded', String(record.expanded));
+                if (record.panel) binding.button.setAttribute('aria-controls', record.panel.id);
+                if (record.retry) record.retry.disabled = busy && !active(record);
+            });
+            records.forEach(record => { if (!visible.has(record)) record.detail?.remove(); });
+        }
+        function schedule() { if (frame === null) frame = requestAnimationFrame(update); }
+        const observer = new MutationObserver(mutations => {
+            if (mutations.every(mutation => {
+                const node = mutation.target.nodeType === 3 ? mutation.target.parentElement : mutation.target;
+                return node?.closest?.('.adeo-marketability-result');
+            })) return;
+            schedule();
+        });
+        const config = { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['href'] };
+        observer.observe(document.body, config); update();
+        timer = setInterval(() => records.forEach(updateTime), 1000);
+        window.addEventListener('pagehide', () => {
+            observer.disconnect(); clearInterval(timer); if (frame !== null) { cancelAnimationFrame(frame); frame = null; }
+            records.forEach(record => { if (active(record)) { stop(record, 'Анализ прерван при уходе со страницы. Его можно запустить повторно.'); render(record); } });
+        });
+        window.addEventListener('pageshow', event => { if (event.persisted) { observer.observe(document.body, config); timer = setInterval(() => records.forEach(updateTime), 1000); update(); } });
+    }
+
     function initSupplierCalendar() {
         function update() {
             if (!/^\/supplier\/supplier-list\/?$/.test(window.location.pathname)) return;
@@ -2586,7 +2930,7 @@
         else if (path.startsWith('/admin/supplier/price/compare/')) initCompare();
         else if (path.startsWith('/admin/supplier/price/comparemode/')) initCompareMode();
         else if (window.location.hostname === 'avatar.adeo.pro' && path === '/istat.php') initImportStatistics();
-        else if (window.location.hostname === 'crm.adeo.pro') initSupplierCalendar();
+        else if (window.location.hostname === 'crm.adeo.pro') { initSupplierCalendar(); initMarketability(); }
     }
 
     installLoadingProgress();
