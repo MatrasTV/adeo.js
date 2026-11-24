@@ -82,15 +82,31 @@ test('Нулевой срок разрешён, доставка раньше о
 
 test('Копирование сдвигает все даты и сохраняет склады, исходник независим', () => {
     const entries = [row('2026-10-27'), row('2026-10-27', { uid: '2', nfile: null, haveDelivery: false, deliveryDate: '' })];
-    const copy = api.copyScheduleDrafts(entries, '2026-10-27', '2026-11-04');
+    const copy = api.copyScheduleDrafts(entries, '2026-10-27', '2026-11-04', weekdays);
     assert.equal(copy[0].sendDate, '2026-11-04');
     assert.equal(copy[0].deliveryDate, '2026-11-05');
     assert.equal(copy[1].nfile, null);
     assert.equal(copy[1].haveDelivery, false);
     copy[0].sendTime = '12:00';
     assert.equal(entries[0].sendTime, '09:00');
-    const backwards = api.copyScheduleDrafts(entries, '2026-10-27', '2026-10-26');
+    const backwards = api.copyScheduleDrafts(entries, '2026-10-27', '2026-10-26', weekdays);
     assert.equal(backwards[0].deliveryDate, '2026-10-27');
+});
+
+test('Копирование выбирает ближайшую дату с учётом дней доставки, времени отправки и субботней приёмки', () => {
+    const source = '2026-11-26', target = '2026-11-27', saturday = '2026-11-28', monday = '2026-11-30';
+    const late = row(source, { deliveryDate: target, deliveryHour: 17 });
+    const onTime = { ...late, deliveryHour: 15 };
+    const beforeSend = { ...late, sendTime: '20:00', deliveryDate: source };
+    const copy = (draft, days) => api.copyScheduleDrafts([draft], source, target, days)[0];
+    assert.equal(copy(late, [0, 1, 2, 3, 4]).deliveryDate, monday);
+    assert.equal(copy(late, weekdays).deliveryDate, monday);
+    assert.equal(copy(late, weekdays).deliveryHour, 17);
+    assert.equal(copy(onTime, weekdays).deliveryDate, saturday);
+    assert.equal(copy(late, [5]).deliveryDate, saturday);
+    assert.equal(copy(beforeSend, weekdays).deliveryDate, monday);
+    assert.equal(copy(late, []).deliveryDate, saturday);
+    assert.equal(late.deliveryDate, target);
 });
 
 test('Формат CRM содержит часовой пояс, последний интервал заканчивается в 23:59', () => {

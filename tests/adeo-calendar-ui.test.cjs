@@ -194,6 +194,68 @@ test('Копирование без дней доставки сохраняет
     } finally { await browser.close(); }
 });
 
+test('Копия переносит доставку на будни и показывает обе версии расписания по времени отправки', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 45000
+}, async () => {
+    const { browser, page, dates, errors } = await fixture();
+    try {
+        const { source, monday } = await page.evaluate(({ friday, saturday }) => {
+            const source = new Date(`${friday}T12:00:00Z`);
+            source.setUTCDate(source.getUTCDate() - 1);
+            const day = source.toISOString().slice(0, 10);
+            const entry = (id, date, time, delivery, hour) => ({ id, supplierId: 127, nfile: 0, weeklyScheduleId: id + 100,
+                ordersAcceptedAt: `${date}T${time}:00+03:00`, orderDeliveryIntervalStart: `${delivery}T${hour}:00:00+03:00`,
+                orderDeliveryIntervalEnd: `${delivery}T${Number(hour) + 1}:00:00+03:00` });
+            window.events = [entry(1, day, '16:00', friday, '17'), entry(2, day, '08:00', day, '17'), entry(3, day, '11:00', friday, '15'),
+                entry(4, friday, '16:00', saturday, '15'), entry(5, friday, '08:00', friday, '17'), entry(6, friday, '11:00', friday, '15')];
+            const monday = new Date(`${saturday}T12:00:00Z`);
+            monday.setUTCDate(monday.getUTCDate() + 2);
+            return { source: day, monday: monday.toISOString().slice(0, 10) };
+        }, dates);
+        await page.getByRole('button', { name: 'Мастер расписания', exact: true }).click();
+        await page.getByRole('button', { name: 'Скопировать день' }).click();
+        await page.getByLabel('Из какого дня', { exact: true }).fill(source);
+        await page.getByLabel('В какой день', { exact: true }).fill(dates.friday);
+        await page.getByRole('button', { name: 'Будни', exact: true }).click();
+        await page.getByRole('button', { name: 'Подготовить копию', exact: true }).click();
+        const rows = page.locator('.adeo-schedule-row');
+        await rows.first().waitFor();
+        assert.deepEqual(await rows.locator('.adeo-schedule-row-time').allTextContents(), ['08:00 · склад 0', '11:00 · склад 0', '16:00 · склад 0']);
+        const deliveryDates = () => rows.getByLabel('Дата доставки', { exact: true }).evaluateAll(inputs => inputs.map(input => input.value));
+        assert.deepEqual(await deliveryDates(), [dates.friday, monday, monday]);
+        assert.match(await page.locator('[data-schedule-summary]').textContent(), /Замечаний: 0/);
+        await page.getByText('Дни доставки и часы приёмки · изменить', { exact: true }).click();
+        await page.getByLabel('Суббота', { exact: true }).check();
+        assert.deepEqual(await deliveryDates(), [dates.friday, dates.saturday, monday]);
+        await page.getByLabel('Суббота', { exact: true }).uncheck();
+        assert.deepEqual(await deliveryDates(), [dates.friday, monday, monday]);
+        await rows.last().locator('summary').click();
+        await rows.last().getByLabel('Дата доставки', { exact: true }).fill(dates.saturday);
+        await rows.last().getByRole('button', { name: 'Ближайший день доставки', exact: true }).click();
+        assert.deepEqual(await deliveryDates(), [dates.friday, monday, monday]);
+        await page.getByRole('button', { name: 'Сохранить всё', exact: true }).click();
+        await page.getByRole('heading', { name: 'Подготовленные копии', exact: true }).waitFor();
+        const tables = page.locator('.adeo-schedule-table');
+        const formatDate = date => date.split('-').reverse().join('.');
+        for (const table of await tables.all()) {
+            assert.deepEqual(await table.locator('tbody td:first-child').allTextContents(),
+                ['08:00', '11:00', '16:00'].map(time => `${formatDate(dates.friday)} · ${time}`));
+        }
+        assert.deepEqual(await tables.last().locator('tbody td:nth-child(3)').allTextContents(), [
+            `${formatDate(dates.friday)} · 17:00–18:00`, `${formatDate(monday)} · 15:00–16:00`, `${formatDate(monday)} · 17:00–18:00`
+        ]);
+        assert.equal(await page.evaluate(() => window.mutations.length), 0);
+        await page.getByRole('button', { name: 'Везде заменить', exact: true }).click();
+        await page.getByRole('button', { name: 'Подтвердить сохранение', exact: true }).click();
+        await page.getByRole('heading', { name: 'Расписание сохранено', exact: true }).waitFor();
+        const payloads = await page.evaluate(() => window.mutations.filter(item => item.type === 'create').map(item => item.payload));
+        assert.deepEqual(payloads.map(item => [item.nfile, item.orderDeliveryIntervalStart]), [
+            [0, `${dates.friday}T17:00:00+03:00`], [0, `${monday}T15:00:00+03:00`], [0, `${monday}T17:00:00+03:00`]
+        ]);
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
 async function seedCopy(page, dates, repeat = 'weekly') {
     await page.evaluate(({ source, target }) => {
         const entry = (id, date, time, nfile, weekly = true) => ({ id, supplierId: 127, nfile,
