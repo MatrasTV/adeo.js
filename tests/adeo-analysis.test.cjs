@@ -84,6 +84,11 @@ test('Кнопка запускает выбранные этапы для од�
             }
             if (url.pathname === '/admin/piqueue/item/log/82') {
                 assert.equal(route.request().method(), 'POST');
+                if (imports > 1) return route.fulfill({ json: { log: `<table>
+                    <tr><td class="gen_td">Импорт окончен. Строк всего: 4</td></tr>
+                    <tr><td class="gen_td">Импортировано: 4</td></tr>
+                    <tr><td class="gen_td">Нулевые остатки: Нет данных</td></tr>
+                </table>` } });
                 return route.fulfill({ json: { log: `<table>
                     <tr><td class="gen_td">Импорт окончен. Строк всего: 7 297</td></tr>
                     <tr><td class="gen_td">Импортировано: 6556, с ошибками: 1</td></tr>
@@ -132,12 +137,36 @@ test('Кнопка запускает выбранные этапы для од�
         const file = page.locator('input[type=file]');
         const launch = page.getByRole('button', { name: 'Запустить', exact: true });
         const salesOption = page.getByRole('checkbox', { name: 'Анализ на продаваемость' });
-        const importOption = page.getByRole('checkbox', { name: 'Импорт в тестовую целлу' });
+        const importOption = page.getByRole('checkbox', { name: 'Импорт в тестовую ячейку' });
         const bar = page.locator('.adeo-relevance-bar');
         const busyNotice = page.getByText('Отчёт по продаваемости занят другим файлом.', { exact: false });
         const selectFile = name => file.setInputFiles({ name, mimeType: 'application/octet-stream', buffer: Buffer.from('прайс') });
+        const dropPrice = names => page.evaluate(names => {
+            const target = document.querySelector('h1');
+            const overlay = document.querySelector('.adeo-relevance-drop');
+            const dataTransfer = new DataTransfer();
+            for (const name of names) dataTransfer.items.add(new File(['прайс'], name));
+            const event = type => new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer });
+            target.dispatchEvent(event('dragenter'));
+            target.dispatchEvent(event('dragover'));
+            const { width, height } = overlay.getBoundingClientRect();
+            const message = overlay.textContent;
+            const prevented = !target.dispatchEvent(event('drop'));
+            return { fullScreen: width === innerWidth && height === innerHeight, message, prevented, hidden: overlay.hidden };
+        }, names);
         const waitForLaunch = () => page.waitForFunction(() => !document.querySelector('.adeo-auto-price-launch').disabled);
         assert.equal(await page.locator('h1').innerText(), 'Авто проверка прайса');
+        assert.deepEqual(await page.locator('.adeo-auto-price-switch > [name^=run-]').evaluateAll(inputs => inputs.map(input => input.name)),
+            ['run-import', 'run-marketability', 'run-sales']);
+        assert.deepEqual(await page.locator('.adeo-auto-price-report h2').allTextContents(),
+            ['Импорт в тестовую ячейку', 'Отчёт о конкурентоспособности', 'Продаваемость']);
+        const options = page.locator('.adeo-auto-price-option');
+        await page.setViewportSize({ width: 1200, height: 844 });
+        const desktop = await options.evaluateAll(cards => cards.map(card => card.getBoundingClientRect().top));
+        assert.equal(new Set(desktop).size, 1, 'На широком экране настройки стоят в один ряд');
+        await page.setViewportSize({ width: 390, height: 844 });
+        const mobile = await options.evaluateAll(cards => cards.map(card => card.getBoundingClientRect().top));
+        assert.ok(mobile[0] < mobile[1] && mobile[1] < mobile[2], 'На узком экране порядок карточек сохраняется');
         assert.equal(await file.count(), 1);
         assert.equal(await page.locator('form, #submitButton, #status').count(), 0);
         assert.equal(await page.evaluate(() => typeof window.refreshJobState), 'undefined');
@@ -155,7 +184,13 @@ test('Кнопка запускает выбранные этапы для од�
         assert.equal(await launch.isDisabled(), true, 'Для запуска нужен файл');
         await period.selectOption('custom');
         await busyNotice.waitFor();
-        await selectFile('Прайс.xlsx');
+        assert.deepEqual(await dropPrice(['Прайс.xlsx']), {
+            fullScreen: true, message: 'Отпустите один файл XLS или XLSX для выбора', prevented: true, hidden: true
+        });
+        assert.equal(await file.evaluate(input => input.files[0]?.name), 'Прайс.xlsx');
+        await dropPrice(['a.xls', 'b.xlsx']);
+        assert.match(await page.locator('.adeo-file-error').innerText(), /один непустой файл/);
+        assert.equal(await file.evaluate(input => input.files[0]?.name), 'Прайс.xlsx');
         assert.equal(await launch.isDisabled(), true, 'Очередь ADEO считается занятой даже при inProcess=false');
         assert.equal(posts, 0);
         status = oldResult;
@@ -196,6 +231,8 @@ test('Кнопка запускает выбранные этапы для од�
         assert.equal(imports, 0);
         assert.equal(await file.isDisabled(), true);
         assert.equal(await launch.isDisabled(), true);
+        assert.equal((await dropPrice(['Другой.xls'])).message, 'Дождитесь завершения текущей проверки');
+        assert.equal(await file.evaluate(input => input.files[0]?.name), 'Прайс.xlsx');
         assert.match(payload, /name="price"; filename=/);
         for (const [name, value] of [['pn', '2'], ['brand', '1'], ['outStart', '5'], ['csrf', 'token']]) {
             assert.ok(payload.includes(`name="${name}"\r\n\r\n${value}\r\n`));
@@ -218,6 +255,7 @@ test('Кнопка запускает выбранные этапы для од�
         assert.deepEqual(await page.locator('.adeo-analysis-grid strong').allTextContents(), ['20 ₽', '1', '2', '-20,00%', '20 ₽']);
         assert.match(await page.locator('.adeo-analysis-brands').innerText(), /Неизвестные бренды: 1/);
         assert.match(await page.locator('.adeo-analysis-warnings').innerText(), /Предупреждений: 1/);
+        assert.equal(await page.getByRole('button', { name: 'Повторить анализ', exact: true }).count(), 0);
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
         assert.equal(await file.isDisabled(), true, 'Выбор нового прайса заблокирован, пока тот же файл ждёт импорта');
         cellBusy = false;
@@ -241,7 +279,9 @@ test('Кнопка запускает выбранные этапы для од�
         assert.equal(importPayload.match(filePart)?.[1], payload.match(filePart)?.[1]);
         assert.equal(importPayload.match(filePart)?.[1], 'прайс');
         const downloadPromise = page.waitForEvent('download');
-        await page.locator('.adeo-relevance-links a').click();
+        const downloadLink = bar.getByRole('link', { name: 'Скачать исходный отчёт', exact: true });
+        assert.equal(await downloadLink.evaluate(link => getComputedStyle(link).backgroundColor), 'rgb(40, 100, 154)');
+        await downloadLink.click();
         const download = await downloadPromise;
         assert.deepEqual(readFileSync(await download.path()), bytes);
 
@@ -251,6 +291,8 @@ test('Кнопка запускает выбранные этапы для од�
         await launch.click();
         await waitForLaunch();
         assert.equal(imports, 2);
+        assert.deepEqual(await importResult.locator('strong').allTextContents(), ['4', '4']);
+        assert.doesNotMatch(await importResult.innerText(), /Нет данных|Ошибки и пропуски/);
         assert.equal(posts, 1, 'Режим импорта не отправляет файл на продаваемость');
         assert.equal(polls, pollsBeforeImportOnly, 'Режим импорта не ждёт отчёт продаваемости');
 

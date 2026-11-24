@@ -18,7 +18,7 @@ function book(rows) {
 }
 function calculate(rows) { return JSON.parse(JSON.stringify(context.calculate(book(rows), XLSX, Decimal))); }
 
-test('Третий этап ждёт успешный импорт и использует идентификатор своего задания CRM', {
+test('Отчёт о конкурентоспособности ждёт успешный импорт и использует идентификатор своего задания CRM', {
     skip: !chromium && 'Нужны Playwright и Chrome'
 }, async () => {
     const browser = await chromium.launch({ channel: 'chrome', headless: true });
@@ -102,20 +102,24 @@ test('Третий этап ждёт успешный импорт и испол
             ${source}` });
         await page.goto('https://admin.adeo.pro/admin/admin_pricerelevance/list?adeo-auto-price=1', { waitUntil: 'commit' });
         await page.getByRole('checkbox', { name: 'Анализ на продаваемость' }).uncheck();
-        const importOption = page.getByRole('checkbox', { name: 'Импорт в тестовую целлу' });
+        const importOption = page.getByRole('checkbox', { name: 'Импорт в тестовую ячейку' });
         const autoReport = page.getByRole('checkbox', { name: 'Отчёт о конкурентоспособности' });
+        const foreign = page.getByRole('checkbox', { name: 'Включать в анализ прайсы заграничных складов' });
+        const markup = page.getByRole('checkbox', { name: 'Добавить наценку ко всем позициям в прайсе' });
         assert.equal(await autoReport.isChecked(), true);
         assert.equal(await importOption.isChecked(), true);
         assert.equal(await importOption.isDisabled(), true);
         await autoReport.uncheck();
         assert.equal(await importOption.isEnabled(), true);
+        for (const option of [foreign, markup]) {
+            assert.equal(await option.isVisible(), true);
+            assert.equal(await option.isDisabled(), true);
+        }
         await importOption.uncheck();
         await autoReport.check();
         assert.equal(await importOption.isChecked(), true);
         assert.equal(await importOption.isDisabled(), true);
         await page.getByLabel('Тестовая ячейка').selectOption('3');
-        const foreign = page.getByRole('checkbox', { name: 'Включать в анализ прайсы заграничных складов' });
-        const markup = page.getByRole('checkbox', { name: 'Добавить наценку ко всем позициям в прайсе' });
         assert.equal(await foreign.isChecked(), false);
         assert.equal(await markup.isChecked(), false);
         await foreign.check();
@@ -123,6 +127,14 @@ test('Третий этап ждёт успешный импорт и испол
         const percent = page.getByLabel('Наценка, %');
         assert.equal(await percent.inputValue(), '10');
         await percent.fill('12.5');
+        await autoReport.uncheck();
+        assert.equal(await percent.isVisible(), true);
+        assert.equal(await percent.isDisabled(), true);
+        await autoReport.check();
+        assert.equal(await foreign.isChecked(), true);
+        assert.equal(await markup.isChecked(), true);
+        assert.equal(await percent.isEnabled(), true);
+        assert.equal(await percent.inputValue(), '12.5');
         await page.locator('input[type=file]').setInputFiles({ name: 'price.xlsx', mimeType: 'application/octet-stream', buffer: Buffer.from('excel') });
         const button = page.getByRole('button', { name: 'Запустить' });
         assert.equal(importId, 0);
@@ -136,7 +148,9 @@ test('Третий этап ждёт успешный импорт и испол
         await page.getByText('Отчёт по CellaTEST/3 готов. Задание CRM: ours-3.', { exact: true }).waitFor();
         assert.deepEqual(await page.locator('.adeo-marketability-metric strong').allTextContents(),
             ['1', '0', '1', '0', '2', '50,00%', '—', '—']);
-        assert.equal(await page.getByRole('link', { name: 'Скачать исходный отчёт' }).getAttribute('href'), reportUrl);
+        const downloadLink = page.getByRole('link', { name: 'Скачать исходный отчёт', exact: true });
+        assert.equal(await downloadLink.getAttribute('href'), reportUrl);
+        assert.equal(await downloadLink.evaluate(link => getComputedStyle(link).backgroundColor), 'rgb(40, 100, 154)');
         assert.equal(crmCalls.filter(call => call.data?.includes('mutation AutoGenerateMarketability')).length, 1);
         assert.deepEqual(errors, []);
     } finally { await browser.close(); }

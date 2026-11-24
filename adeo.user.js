@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADEO — прайсы и расписание поставщиков
 // @namespace    admin.adeo.pro
-// @version      3.7.1
+// @version      3.7.2
 // @description  Работа с прайсами и мастер расписания поставщиков CRM
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
@@ -38,6 +38,7 @@
     const CRM_REPORT_MAX_BYTES = 50 * 1024 * 1024;
     const AUTO_PRICE_CHECK_TITLE = 'Авто проверка прайса';
     const AUTO_PRICE_CHECK_PARAM = 'adeo-auto-price';
+    const AUTO_PRICE_DOWNLOAD_LABEL = 'Скачать исходный отчёт';
     const RELEVANCE_DEFAULTS = { outStart: '5', orders_avg_cost: false, orders_max_cost: false };
     const PAGE_SIZES = [10, 50, 100, 500, 1000, 3000, 5000, 10000, 100000];
     const initializedFields = new WeakSet();
@@ -431,6 +432,7 @@
         state.notify();
         const current = () => token === analysis.token && revision === state.revision;
         const fail = message => { if (current()) stopRelevanceAnalysis(message); };
+        const downloadHint = autoPriceCheckPage ? 'Можно скачать Excel.' : 'Можно повторить анализ или скачать Excel.';
         try {
             if (analysis.outputStart !== null && analysis.outputStart !== undefined && Number(analysis.outputStart) < 5) {
                 throw new Error('Для анализа по правилам ARM добавляйте результирующие колонки после 5-го столбца или дальше, чтобы сохранить наличие в D и цену в E.');
@@ -439,7 +441,7 @@
             if (analysis.blob && analysis.source === link.href) buffer = await analysis.blob.arrayBuffer();
             else {
                 analysis.controller = new AbortController();
-                analysis.timer = setTimeout(() => fail('Сервер слишком долго передаёт результат. Можно повторить анализ или скачать Excel.'), 90000);
+                analysis.timer = setTimeout(() => fail(`Сервер слишком долго передаёт результат. ${downloadHint}`), 90000);
                 const response = await fetch(link.href, { credentials: 'same-origin', cache: 'no-store', signal: analysis.controller.signal });
                 if (!current()) return;
                 if (!response.ok) throw new Error(`Не удалось получить результат: HTTP ${response.status}.`);
@@ -474,7 +476,7 @@
             const workerUrl = URL.createObjectURL(new Blob([getRelevanceWorkerSources(), '\n;\n',
                 `(${relevanceAnalysisWorker.toString()})(${calculateRelevanceWorkbook.toString()});`], { type: 'application/javascript' }));
             try { analysis.worker = new Worker(workerUrl); }
-            catch { throw new Error('Браузер не разрешил фоновый анализ. Можно скачать Excel или повторить анализ после проверки разрешений браузера.'); }
+            catch { throw new Error(`Браузер не разрешил фоновый анализ. ${downloadHint}`); }
             finally { URL.revokeObjectURL(workerUrl); }
             analysis.worker.onerror = event => {
                 event.preventDefault(); fail('Не удалось запустить анализ. Обновите страницу и повторите попытку. Если ошибка повторяется, проверьте разрешение фоновой обработки в браузере.');
@@ -488,7 +490,7 @@
                 }
                 state.notify();
             };
-            analysis.timer = setTimeout(() => fail('Анализ выполняется дольше 5 минут и остановлен. Можно повторить его или скачать Excel.'), 300000);
+            analysis.timer = setTimeout(() => fail(`Анализ выполняется дольше 5 минут и остановлен. ${downloadHint}`), 300000);
             analysis.worker.postMessage({ buffer }, [buffer]);
         } catch (error) { fail(error.name === 'TypeError' ? 'Не удалось получить файл для анализа. Проверьте соединение и повторите попытку.' : error.message || 'Не удалось проанализировать файл.'); }
     }
@@ -809,6 +811,7 @@
         for (const [label, pattern, issue] of metrics) {
             const row = rows.findLast(entry => pattern.test(entry.text));
             const value = row?.text.replace(pattern, '').match(/^\d+(?:[ \u00a0\u202f]\d{3})*/)?.[0];
+            if (issue && !value) continue;
             const count = value ? formatter.format(BigInt(value.replace(/\s/g, ''))) : 'Нет данных';
             if (!issue) {
                 const card = document.createElement('article');
@@ -841,7 +844,8 @@
             details.append(summary, list);
             issues.append(details);
         }
-        results.replaceChildren(grid, heading, issues);
+        results.replaceChildren(grid);
+        if (issues.childElementCount) results.append(heading, issues);
     }
 
     async function showTestPriceImportLog(results, jobId, signal) {
@@ -1060,11 +1064,14 @@
             status.textContent = `Ожидаем отчёт по CellaTEST/${cell}. Задание CRM: ${workflowId}.`;
             const href = await waitForCrmMarketability(workflowId, signal);
             await ensureCurrentImport();
+            const links = document.createElement('div');
+            links.className = 'adeo-relevance-links';
             const link = document.createElement('a');
             link.href = href;
             link.download = '';
-            link.textContent = 'Скачать исходный отчёт';
-            results.append(link);
+            link.textContent = AUTO_PRICE_DOWNLOAD_LABEL;
+            links.append(link);
+            results.append(links);
             results.hidden = false;
             status.textContent = 'Получаем Excel отчёта CRM…';
             const file = await requestMarketabilityResource({
@@ -1110,57 +1117,64 @@
                 <fieldset class="adeo-auto-price-settings">
                     <legend>Настройки проверки</legend>
                     <div class="adeo-auto-price-actions">
-                        <label><input type="checkbox" name="run-sales" checked> Анализ на продаваемость</label>
-                        <label><input type="checkbox" name="run-import" checked> Импорт в тестовую целлу</label>
-                        <label><input type="checkbox" name="run-marketability" checked> Отчёт о конкурентоспособности</label>
-                    </div>
-                    <label>Период продаваемости
-                        <select name="sales-period">
-                            <option value="30">30 дней</option>
-                            <option value="90">90 дней</option>
-                            <option value="half-year">Полгода</option>
-                            <option value="year">Год</option>
-                            <option value="custom">Свой период</option>
-                        </select>
-                    </label>
-                    <label>Тестовая ячейка
-                        <select name="test-cell">
-                            ${Array.from({ length: 10 }, (_, index) => `<option value="${index + 1}">CellaTEST/${index + 1}</option>`).join('')}
-                        </select>
-                    </label>
-                    <label class="adeo-auto-price-custom-start" hidden>Дата начала (по сегодня)
-                        <input name="sales-start" type="date" required>
-                    </label>
-                    <div class="adeo-auto-price-marketability-settings" hidden>
-                        <label><input type="checkbox" name="marketability-foreign"> Включать в анализ прайсы заграничных складов</label>
-                        <label><input type="checkbox" name="marketability-markup-enabled"> Добавить наценку ко всем позициям в прайсе</label>
-                        <label class="adeo-auto-price-markup" hidden>Наценка, %
-                            <input type="number" name="marketability-markup" value="10" step="0.1" required>
-                        </label>
+                        <div class="adeo-auto-price-option">
+                            <label class="adeo-auto-price-switch"><input type="checkbox" name="run-import" aria-describedby="adeo-auto-price-import-hint" checked> Импорт в тестовую ячейку</label>
+                            <label>Тестовая ячейка
+                                <select name="test-cell">
+                                    ${Array.from({ length: 10 }, (_, index) => `<option value="${index + 1}">CellaTEST/${index + 1}</option>`).join('')}
+                                </select>
+                            </label>
+                            <p id="adeo-auto-price-import-hint">Для отчёта о конкурентоспособности нужен импорт.</p>
+                        </div>
+                        <div class="adeo-auto-price-option">
+                            <label class="adeo-auto-price-switch"><input type="checkbox" name="run-marketability" checked> Отчёт о конкурентоспособности</label>
+                            <fieldset class="adeo-auto-price-marketability-settings" aria-label="Настройки конкурентоспособности">
+                                <label class="adeo-auto-price-switch"><input type="checkbox" name="marketability-foreign"> Включать в анализ прайсы заграничных складов</label>
+                                <label class="adeo-auto-price-switch"><input type="checkbox" name="marketability-markup-enabled"> Добавить наценку ко всем позициям в прайсе</label>
+                                <label class="adeo-auto-price-markup" hidden>Наценка, %
+                                    <input type="number" name="marketability-markup" value="10" step="0.1" required>
+                                </label>
+                            </fieldset>
+                        </div>
+                        <div class="adeo-auto-price-option">
+                            <label class="adeo-auto-price-switch"><input type="checkbox" name="run-sales" checked> Анализ на продаваемость</label>
+                            <label>Период продаваемости
+                                <select name="sales-period">
+                                    <option value="30">30 дней</option>
+                                    <option value="90">90 дней</option>
+                                    <option value="half-year">Полгода</option>
+                                    <option value="year">Год</option>
+                                    <option value="custom">Свой период</option>
+                                </select>
+                            </label>
+                            <label hidden>Дата начала (по сегодня)
+                                <input name="sales-start" type="date" required>
+                            </label>
+                        </div>
                     </div>
                 </fieldset>
-                <div class="adeo-file-card">
+                <div class="adeo-auto-price-file">
                     <label class="adeo-file-info">
                         <span class="adeo-file-name">Выберите прайс</span>
+                        <span class="adeo-file-hint">XLS или XLSX · Можно перетащить файл в любое место страницы</span>
                         <input type="file" accept=".xls,.xlsx" disabled aria-describedby="adeo-auto-price-availability">
                     </label>
-                    <div class="adeo-file-hint">XLS или XLSX</div>
                     <button type="button" class="adeo-auto-price-launch" disabled>Запустить</button>
+                    <p class="adeo-file-error" role="alert" hidden></p>
                 </div>
-                <p class="adeo-file-error" role="alert" hidden></p>
-                <section class="adeo-auto-price-sales" aria-labelledby="adeo-auto-price-sales-title">
-                    <h2 id="adeo-auto-price-sales-title" class="adeo-auto-price-test">Продаваемость</h2>
-                    <p id="adeo-auto-price-availability" class="adeo-auto-price-availability" role="status"></p>
-                </section>
-                <section class="adeo-auto-price-import" aria-labelledby="adeo-auto-price-import-title">
-                    <h2 id="adeo-auto-price-import-title" class="adeo-auto-price-test">Импорт в тестовую ячейку</h2>
+                <section class="adeo-auto-price-report adeo-auto-price-import" aria-labelledby="adeo-auto-price-import-title">
+                    <h2 id="adeo-auto-price-import-title">Импорт в тестовую ячейку</h2>
                     <p class="adeo-auto-price-import-status" role="status">Ожидает запуска.</p>
                     <section class="adeo-auto-price-import-results adeo-analysis-results" aria-label="Результат импорта" hidden></section>
                 </section>
-                <section class="adeo-auto-price-import adeo-auto-price-marketability" aria-labelledby="adeo-auto-price-marketability-title" hidden>
-                    <h2 id="adeo-auto-price-marketability-title" class="adeo-auto-price-test">Отчёт о конкурентоспособности</h2>
+                <section class="adeo-auto-price-report adeo-auto-price-marketability" aria-labelledby="adeo-auto-price-marketability-title" hidden>
+                    <h2 id="adeo-auto-price-marketability-title">Отчёт о конкурентоспособности</h2>
                     <p class="adeo-auto-price-import-status" role="status">Ожидает запуска.</p>
                     <section class="adeo-auto-price-import-results adeo-analysis-results" aria-label="Результат конкурентоспособности" hidden></section>
+                </section>
+                <section class="adeo-auto-price-report adeo-auto-price-sales" aria-labelledby="adeo-auto-price-sales-title">
+                    <h2 id="adeo-auto-price-sales-title">Продаваемость</h2>
+                    <p id="adeo-auto-price-availability" class="adeo-auto-price-availability" role="status"></p>
                 </section>
             </div>`;
         document.body.append(main);
@@ -1169,6 +1183,7 @@
         const settings = main.querySelector('.adeo-auto-price-settings');
         const salesOption = settings.querySelector('[name=run-sales]');
         const importOption = settings.querySelector('[name=run-import]');
+        const importHint = settings.querySelector('#adeo-auto-price-import-hint');
         const marketabilityOption = settings.querySelector('[name=run-marketability]');
         const marketabilitySettings = settings.querySelector('.adeo-auto-price-marketability-settings');
         const foreignStock = marketabilitySettings.querySelector('[name=marketability-foreign]');
@@ -1186,9 +1201,9 @@
         const marketabilityStatus = marketabilitySection.querySelector('[role=status]');
         const marketabilityResults = marketabilitySection.querySelector('.adeo-auto-price-import-results');
         const availability = main.querySelector('#adeo-auto-price-availability');
-        const importTitle = main.querySelector('#adeo-auto-price-import-title');
-        const importStatus = main.querySelector('.adeo-auto-price-import-status');
-        const importResults = main.querySelector('.adeo-auto-price-import-results');
+        const importTitle = importSection.querySelector('h2');
+        const importStatus = importSection.querySelector('[role=status]');
+        const importResults = importSection.querySelector('.adeo-auto-price-import-results');
         const error = main.querySelector('.adeo-file-error');
         let reportAvailable = false;
         let availabilityController;
@@ -1201,7 +1216,10 @@
             const marketability = marketabilityOption.checked;
             if (marketability) importOption.checked = true;
             importOption.disabled = marketability;
-            marketabilitySettings.hidden = marketabilitySection.hidden = !marketability;
+            importHint.hidden = !marketability;
+            if (marketability) importOption.setAttribute('aria-describedby', importHint.id);
+            else importOption.removeAttribute('aria-describedby');
+            marketabilitySettings.disabled = marketabilitySection.hidden = !marketability;
             markupPercent.closest('label').hidden = !markupEnabled.checked;
             customStartField.hidden = !customPeriod;
             settings.disabled = running;
@@ -1265,12 +1283,16 @@
             if (typeof GM_setValue === 'function') GM_setValue(TEST_PRICE_CELL_KEY, cellSelect.value);
         });
 
+        function showFileError(message) {
+            error.textContent = message;
+            error.hidden = !message;
+        }
         input.addEventListener('change', () => {
             const file = input.files[0];
-            error.textContent = 'Выберите непустой файл XLS или XLSX.';
-            error.hidden = !file || isRelevanceFile(file);
+            showFileError(file && !isRelevanceFile(file) ? 'Выберите непустой файл XLS или XLSX.' : '');
             syncControls();
         });
+        mountRelevanceFileDrop(input, showFileError);
 
         launch.addEventListener('click', async () => {
             if (launch.disabled) return;
@@ -1356,46 +1378,66 @@
         const style = document.createElement('style');
         style.id = 'adeo-relevance-styles';
         style.textContent = `
-            .adeo-auto-price { margin: 0; background: #edf2f7; color: #26394d; font: 15px/1.5 Arial, sans-serif; }
-            .adeo-auto-price main { width: min(1120px, calc(100% - 32px)); margin: 32px auto; }
-            .adeo-auto-price h1 { margin: 0 0 18px; font-size: clamp(24px, 4vw, 32px); }
-            .adeo-auto-price-test { margin: 0; padding: 12px 24px; font-size: 18px; }
-            .adeo-auto-price-settings { display: flex; flex-wrap: wrap; gap: 12px 20px; min-width: 0; margin: 16px 12px 0; padding: 12px; border: 1px solid #d8e0e8; border-radius: 6px; }
-            .adeo-auto-price-settings legend { padding: 0 6px; font-weight: bold; }
-            .adeo-auto-price-settings label { display: grid; gap: 4px; }
-            .adeo-auto-price-actions { display: flex; flex: 1 0 100%; flex-wrap: wrap; gap: 8px 20px; }
-            .adeo-auto-price-actions label { display: flex; align-items: center; gap: 6px; }
-            .adeo-auto-price-actions input { accent-color: #28649a; }
-            .adeo-auto-price-settings :is(select, input[type=date], input[type=number]) { box-sizing: border-box; width: 100%; min-height: 36px; padding: 4px 8px; border: 1px solid #afc3d6; border-radius: 4px; background: white; color: inherit; font: inherit; }
-            .adeo-auto-price-marketability-settings { display: grid; flex-basis: 100%; gap: 6px; }
-            .adeo-auto-price-marketability-settings label:has(input[type=checkbox]) { display: flex; align-items: center; gap: 6px; }
-            .adeo-auto-price-markup { width: 120px; }
-            .adeo-auto-price .adeo-file-info { display: grid; gap: 4px; min-width: 0; }
-            .adeo-auto-price input[type=file] { max-width: 100%; }
-            .adeo-auto-price-availability { margin: 0; padding: 0 24px 8px; color: #825019; }
-            .adeo-auto-price-availability:empty { padding: 0; }
+            .adeo-relevance #price-form { border: 1px solid #d8e0e8; border-radius: 6px; background: #f8fafc; color: #26394d; }
+            .adeo-relevance .adeo-file-info { flex: 1; min-width: 180px; overflow-wrap: anywhere; }
+            .adeo-relevance .adeo-file-name { font-weight: bold; margin-bottom: 5px; }
+            .adeo-relevance .adeo-file-hint { color: #597086; font-size: 13px; }
+            .adeo-relevance .adeo-file-error { color: #a52b27; padding: 0 12px; }
+            .adeo-auto-price { margin: 0; background: #edf2f7; color: #26394d; font: 15px/1.5 system-ui, sans-serif; }
+            .adeo-auto-price main { width: min(1120px, calc(100% - 32px)); margin: clamp(20px, 4vw, 48px) auto; }
+            .adeo-auto-price h1 { margin: 0 0 20px; font-size: clamp(26px, 4vw, 36px); line-height: 1.15; }
+            .adeo-auto-price #price-form { display: grid; gap: 16px; border: 0; background: transparent; }
+            .adeo-auto-price-settings { min-width: 0; margin: 0; padding: 0; border: 0; }
+            .adeo-auto-price-settings legend { margin-bottom: 10px; padding: 0; font-size: 17px; font-weight: 650; }
+            .adeo-auto-price-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+            .adeo-auto-price-option, .adeo-auto-price-file, .adeo-auto-price-report { min-width: 0; padding: 18px; border: 1px solid #d2deea; border-radius: 12px; background: #fff; }
+            .adeo-auto-price-option { display: grid; align-content: start; gap: 12px; }
+            .adeo-auto-price-option:has(> label > input:checked) { border-color: #9eb9d3; }
+            .adeo-auto-price-option label { display: grid; gap: 4px; font-size: 14px; }
+            .adeo-auto-price-option > .adeo-auto-price-switch { font-size: 15px; font-weight: 650; }
+            .adeo-auto-price-option .adeo-auto-price-switch { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; }
+            .adeo-auto-price-switch:has(input:disabled) { cursor: default; }
+            .adeo-auto-price-switch input { flex: none; width: 16px; height: 16px; margin: 3px 0 0; accent-color: #28649a; }
+            .adeo-auto-price-settings :is(select, input[type=date], input[type=number]) { box-sizing: border-box; width: 100%; min-width: 0; min-height: 38px; padding: 4px 8px; border: 1px solid #afc3d6; border-radius: 6px; background: white; color: inherit; font: inherit; }
+            .adeo-auto-price-marketability-settings { display: grid; gap: 8px; min-width: 0; margin: 0; padding: 0; border: 0; }
+            .adeo-auto-price-marketability-settings:disabled { color: #6b7280; }
+            .adeo-auto-price-marketability-settings:disabled input[type=number] { background: #f0f2f5; }
+            .adeo-auto-price-markup { width: min(120px, 100%); }
+            #adeo-auto-price-import-hint { margin: 0; color: #516a82; font-size: 13px; }
+            .adeo-auto-price-file { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 12px 20px; }
+            .adeo-auto-price .adeo-file-info { display: grid; gap: 2px; min-width: 0; }
+            .adeo-auto-price .adeo-file-name { margin: 0; font-size: 17px; }
+            .adeo-auto-price input[type=file] { width: 100%; margin-top: 8px; color: inherit; font: 14px/1.5 system-ui, sans-serif; }
+            .adeo-auto-price input[type=file]::file-selector-button { min-height: 40px; margin-right: 10px; padding: 6px 12px; border: 1px solid #afc3d6; border-radius: 6px; background: #f2f6fb; color: inherit; font: inherit; }
+            .adeo-auto-price input[type=file]:not(:disabled)::file-selector-button { cursor: pointer; }
+            .adeo-auto-price .adeo-file-error { grid-column: 1 / -1; margin: 0; padding: 0; overflow-wrap: anywhere; }
+            .adeo-auto-price-report h2 { margin: 0 0 6px; font-size: 18px; line-height: 1.3; }
+            .adeo-auto-price-availability { margin: 0; color: #825019; }
             .adeo-auto-price-availability:not(:empty) + .adeo-relevance-bar[data-stage=idle] { display: none; }
-            .adeo-auto-price-import { padding-bottom: 14px; border-top: 1px solid #d8e0e8; }
-            .adeo-auto-price-import-status { margin: 0; padding: 0 24px; overflow-wrap: anywhere; }
-            .adeo-auto-price-import-results { padding: 14px 24px 0; }
+            .adeo-auto-price-import-status { margin: 0; color: #516a82; overflow-wrap: anywhere; }
+            .adeo-auto-price .adeo-relevance-bar { margin-top: 10px; padding: 14px; border: 1px solid #d2deea; border-radius: 8px; }
+            .adeo-auto-price .adeo-relevance-bar[data-stage=done] { border-color: #91bfa5; }
+            .adeo-auto-price .adeo-relevance-bar:is([data-stage=error], [data-analysis-phase=error]) { border-color: #cb625d; }
+            .adeo-auto-price .adeo-analysis-grid { grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr)); }
+            .adeo-auto-price .adeo-marketability-metric { overflow-wrap: anywhere; }
             .adeo-auto-price-import-results .adeo-analysis-grid { margin-bottom: 12px; }
             .adeo-auto-price-import-errors p { margin: 8px 0; }
             .adeo-auto-price-import-errors details { margin-top: 8px; }
             .adeo-auto-price-import-errors li { overflow-wrap: anywhere; }
-            .adeo-relevance #price-form { border: 1px solid #d8e0e8; border-radius: 6px; background: #f8fafc; color: #26394d; }
+            @media (max-width: 760px) {
+                .adeo-auto-price-actions { grid-template-columns: minmax(0, 1fr); }
+                .adeo-auto-price-option, .adeo-auto-price-file, .adeo-auto-price-report { padding: 14px; }
+            }
+            @media (max-width: 480px) { .adeo-auto-price-file { grid-template-columns: minmax(0, 1fr); } }
             .adeo-relevance .adeo-relevance-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 12px; }
             .adeo-relevance #price-form button, .adeo-relevance #submitButton { box-sizing: border-box; min-height: 36px; padding: 7px 14px; border: 1px solid #c4cdd7; border-radius: 4px; background: #fff; color: #26394d; font: 14px Arial, sans-serif; cursor: pointer; }
             .adeo-relevance #price-form button:hover:not(:disabled) { background: #eaf1f8; border-color: #8faac4; }
-            .adeo-auto-price #price-form .adeo-auto-price-launch { background: #28649a; border-color: #28649a; color: white; }
+            .adeo-auto-price #price-form .adeo-auto-price-launch { min-height: 40px; padding-inline: 24px; border-radius: 6px; background: #28649a; border-color: #28649a; color: white; font: 650 14px/1.4 system-ui, sans-serif; }
             .adeo-auto-price #price-form .adeo-auto-price-launch:hover:not(:disabled) { background: #204f7b; }
             .adeo-relevance #submitButton { background: #28649a; border-color: #28649a; color: white; }
             .adeo-relevance #price-form :disabled { opacity: .5; cursor: default; }
             .adeo-relevance #price-form :focus-visible, .adeo-relevance-bar a:focus-visible { outline: 2px solid #3274b5; outline-offset: 3px; }
             .adeo-relevance .adeo-file-card { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 12px; padding: 24px; border: 2px dashed #afc3d6; border-radius: 6px; background: #fff; }
-            .adeo-relevance .adeo-file-info { flex: 1; min-width: 180px; overflow-wrap: anywhere; }
-            .adeo-relevance .adeo-file-name { font-weight: bold; margin-bottom: 5px; }
-            .adeo-relevance .adeo-file-hint { color: #597086; font-size: 13px; }
-            .adeo-relevance .adeo-file-error { color: #a52b27; padding: 0 12px; }
             .adeo-relevance .adeo-relevance-settings { padding: 16px 12px; border-top: 1px solid #d8e0e8; }
             .adeo-relevance .adeo-relevance-settings input:not([type=checkbox]) { box-sizing: border-box; max-width: 100%; width: 180px; padding: 6px 8px; border: 1px solid #c4cdd7; border-radius: 4px; }
             .adeo-relevance .adeo-relevance-settings label { display: inline-block; margin-right: 8px; }
@@ -1423,6 +1465,8 @@
             .adeo-result-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
             .adeo-relevance-links, .adeo-analysis-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
             .adeo-relevance-links a { display: inline-block; padding: 6px 12px; background: #28649a; color: white; border-radius: 4px; }
+            .adeo-auto-price .adeo-relevance-links a { padding: 9px 14px; border-radius: 6px; font: 650 14px/1.4 system-ui, sans-serif; text-decoration: none; }
+            .adeo-auto-price .adeo-relevance-links a:hover { background: #204f7b; }
             .adeo-analysis-results { margin-top: 16px; border-top: 1px solid #d8e0e8; padding-top: 14px; }
             .adeo-analysis-results h3 { font: bold 16px/1.5 Arial, sans-serif; margin: 0 0 12px; overflow-wrap: anywhere; }
             .adeo-analysis-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
@@ -1464,7 +1508,8 @@
         const links = element('div', 'adeo-relevance-links');
         const actions = element('div', 'adeo-analysis-actions');
         const analyze = createButton('Проанализировать прошлый результат', () => void startRelevanceAnalysis(), 'adeo-analysis-start');
-        const cancel = createButton('Остановить анализ', () => stopRelevanceAnalysis('Анализ остановлен. Excel можно скачать или проанализировать повторно.'), 'adeo-analysis-cancel');
+        const cancelMessage = autoPriceCheckPage ? 'Анализ остановлен. Excel можно скачать.' : 'Анализ остановлен. Excel можно скачать или проанализировать повторно.';
+        const cancel = createButton('Остановить анализ', () => stopRelevanceAnalysis(cancelMessage), 'adeo-analysis-cancel');
         actions.append(analyze, cancel);
         const resultActions = element('div', 'adeo-result-actions'); resultActions.append(links, actions);
         const results = element('div', 'adeo-analysis-results'); results.hidden = true;
@@ -1533,12 +1578,13 @@
                 if (i === index) step.setAttribute('aria-current', 'step'); else step.removeAttribute('aria-current');
             });
             links.replaceChildren(...state.links.map(link => {
-                const a = element('a', '', link.text);
+                const a = element('a', '', autoPriceCheckPage ? AUTO_PRICE_DOWNLOAD_LABEL : link.text);
                 a.href = local && analysis.blobUrl && analysis.source === link.href ? analysis.blobUrl : link.href;
                 if (a.href === analysis.blobUrl) a.download = analysis.fileName;
                 return a;
             }));
-            analyze.hidden = state.stage !== 'done' || state.busy || active || !state.links.length;
+            analyze.hidden = state.stage !== 'done' || state.busy || active || !state.links.length ||
+                (autoPriceCheckPage && analysis.phase !== 'idle');
             analyze.textContent = analysis.phase === 'idle' ? (state.revision === 0 ? 'Проанализировать прошлый результат' : 'Проанализировать результат') : 'Повторить анализ';
             cancel.hidden = !active;
             actions.hidden = analyze.hidden && cancel.hidden;
@@ -1556,13 +1602,64 @@
         let timer = setInterval(updateTime, 1000);
         window.addEventListener('pagehide', event => {
             clearInterval(timer);
-            if (relevanceAnalysisRunning()) stopRelevanceAnalysis('Анализ прерван при уходе со страницы. Его можно запустить повторно.');
+            if (relevanceAnalysisRunning()) stopRelevanceAnalysis(autoPriceCheckPage ? 'Анализ прерван при уходе со страницы.' :
+                'Анализ прерван при уходе со страницы. Его можно запустить повторно.');
             if (!event.persisted && relevanceAnalysis.blobUrl) { URL.revokeObjectURL(relevanceAnalysis.blobUrl); relevanceAnalysis.blobUrl = ''; }
         });
         window.addEventListener('pageshow', event => {
             if (!event.persisted) return;
             timer = setInterval(updateTime, 1000); render();
         });
+    }
+
+    function mountRelevanceFileDrop(input, showError) {
+        const overlay = document.createElement('div');
+        overlay.className = 'adeo-relevance-drop';
+        overlay.hidden = true;
+        document.body.append(overlay);
+
+        let dragDepth = 0;
+        const hasFiles = event => Array.from(event.dataTransfer?.types ?? []).includes('Files');
+        function showOverlay() {
+            const message = input.disabled ? 'Дождитесь завершения текущей проверки' : 'Отпустите один файл XLS или XLSX для выбора';
+            if (overlay.textContent !== message) overlay.textContent = message;
+            overlay.hidden = false;
+        }
+        function clearDrag() {
+            dragDepth = 0;
+            overlay.hidden = true;
+        }
+        document.addEventListener('dragenter', event => {
+            if (!hasFiles(event)) return;
+            event.preventDefault();
+            dragDepth++;
+            showOverlay();
+        });
+        document.addEventListener('dragover', event => {
+            if (!hasFiles(event)) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = input.disabled ? 'none' : 'copy';
+            showOverlay();
+        });
+        document.addEventListener('dragleave', event => { if (hasFiles(event) && --dragDepth <= 0) clearDrag(); });
+        document.addEventListener('drop', event => {
+            if (!hasFiles(event)) return;
+            event.preventDefault();
+            clearDrag();
+            if (input.disabled) return;
+            const files = event.dataTransfer.files;
+            if (files.length !== 1 || !isRelevanceFile(files[0])) {
+                showError('Перетащите один непустой файл XLS или XLSX.');
+                return;
+            }
+            try {
+                input.files = files;
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+            } catch { showError('Браузер не смог принять файл. Выберите его через поле загрузки.'); }
+        });
+        window.addEventListener('blur', clearDrag);
+        document.addEventListener('dragend', clearDrag);
+        window.addEventListener('pagehide', clearDrag);
     }
 
     function enhancePriceRelevance() {
@@ -1605,8 +1702,6 @@
         });
         const error = element('p', 'adeo-file-error'); error.setAttribute('role', 'alert'); error.hidden = true;
         form.append(card, error, tools, settings);
-        const overlay = element('div', 'adeo-relevance-drop', 'Отпустите один файл XLS или XLSX для выбора');
-        overlay.hidden = true; document.body.append(overlay);
 
         const originalStatusBox = status.closest('.container-fluid');
         if (originalStatusBox && !originalStatusBox.contains(form)) originalStatusBox.hidden = true;
@@ -1641,34 +1736,8 @@
         // Штатный опрос может менять disabled: блокировка учитывает также локальную отправку.
         const observer = new MutationObserver(syncControls);
         observer.observe(submit, { attributes: true, attributeFilter: ['disabled'] });
-        let dragDepth = 0;
-        const hasFiles = event => Array.from(event.dataTransfer?.types ?? []).includes('Files');
-        document.addEventListener('dragenter', event => {
-            if (!hasFiles(event)) return;
-            event.preventDefault(); dragDepth++;
-            overlay.textContent = state.busy || relevanceAnalysisRunning() ? 'Дождитесь завершения текущей проверки' : 'Отпустите один файл XLS или XLSX для выбора';
-            overlay.hidden = false;
-        });
-        document.addEventListener('dragover', event => {
-            if (!hasFiles(event)) return;
-            event.preventDefault(); event.dataTransfer.dropEffect = state.busy || relevanceAnalysisRunning() ? 'none' : 'copy';
-        });
-        const clearDrag = () => { dragDepth = 0; overlay.hidden = true; };
-        document.addEventListener('dragleave', event => { if (hasFiles(event) && --dragDepth <= 0) clearDrag(); });
-        document.addEventListener('drop', event => {
-            if (!hasFiles(event)) return;
-            event.preventDefault(); clearDrag();
-            if (state.busy || relevanceAnalysisRunning()) return;
-            const files = event.dataTransfer.files;
-            if (files.length !== 1 || !isRelevanceFile(files[0])) { showError('Перетащите один непустой файл XLS или XLSX.'); return; }
-            try {
-                input.files = files;
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-            } catch { showError('Браузер не смог принять файл. Используйте кнопку «Выбрать файл».'); }
-        });
-        window.addEventListener('blur', clearDrag);
-        document.addEventListener('dragend', clearDrag);
-        window.addEventListener('pagehide', () => { observer.disconnect(); clearDrag(); });
+        mountRelevanceFileDrop(input, showError);
+        window.addEventListener('pagehide', () => observer.disconnect());
         window.addEventListener('pageshow', event => {
             if (event.persisted) observer.observe(submit, { attributes: true, attributeFilter: ['disabled'] });
         });
