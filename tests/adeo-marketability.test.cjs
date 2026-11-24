@@ -18,6 +18,130 @@ function book(rows) {
 }
 function calculate(rows) { return JSON.parse(JSON.stringify(context.calculate(book(rows), XLSX, Decimal))); }
 
+test('Третий этап ждёт успешный импорт и использует идентификатор своего задания CRM', {
+    skip: !chromium && 'Нужны Playwright и Chrome'
+}, async () => {
+    const browser = await chromium.launch({ channel: 'chrome', headless: true });
+    try {
+        const page = await browser.newPage();
+        const errors = [];
+        page.on('pageerror', error => errors.push(error.message));
+        const crmCalls = [];
+        let importId = 0, resultChecks = 0;
+        let importReady = false;
+        const excel = XLSX.write(book([headers, position(1), position(2)]), { bookType: 'xlsx', type: 'buffer' });
+        await page.route('**/*', route => {
+            const url = new URL(route.request().url());
+            if (url.origin !== 'https://admin.adeo.pro') return route.abort('blockedbyclient');
+            if (url.pathname.endsWith('/admin_pricerelevance/list')) {
+                return route.fulfill({ contentType: 'text/html', body: '<html><body></body></html>' });
+            }
+            const json = value => route.fulfill({ json: value });
+            if (url.pathname.endsWith('/admin_pricerelevance/state')) return json({ message: '', inProcess: false });
+            if (url.pathname.endsWith('/cella/inqueue/43068/3')) return json({ job_id: importId });
+            if (url.pathname.endsWith('/comparemode/43068/3') && route.request().method() === 'POST') {
+                importId++;
+                return json({ url: '/confirm-import' });
+            }
+            if (url.pathname === '/confirm-import') {
+                return route.fulfill({ body: `${url.searchParams.get('callback')}({"job_id":${importId}});` });
+            }
+            if (url.pathname.endsWith('/item/info/1')) return json({ state: 3, info: 'Ошибка импорта.' });
+            if (url.pathname.endsWith('/item/info/2')) {
+                return json(importReady ? { state: 3, info: '<div>Импорт окончен. Строк: 2</div>' }
+                    : { state: 2, info: 'Импорт выполняется.' });
+            }
+            if (/\/item\/log\/[12]$/.test(url.pathname)) {
+                return json({ log: '<table><tr><td class="gen_td">Строк всего: 2</td></tr></table>' });
+            }
+            return route.fulfill({ status: 404 });
+        });
+        const reportUrl = 'https://s3.adeo.pro/crm-bucket-1d/ours.xlsx';
+        await page.exposeFunction('mockCrmMarketabilityRequest', ({ url, data, anonymous }) => {
+            crmCalls.push({ url, data });
+            assert.equal(importReady, true, 'До окончания импорта нет запросов отчёта CRM');
+            if (url === reportUrl) {
+                assert.equal(anonymous, true);
+                return { status: 200, bytes: [...excel] };
+            }
+            assert.equal(url, 'https://crm.adeo.pro/svc-platform-v1/graphql');
+            const { query, variables } = JSON.parse(data);
+            const response = data => ({ status: 200, response: { data } });
+            if (query.includes('query AutoMarketabilityStorage')) {
+                assert.equal(variables.supplierId, 43068);
+                return response({ supplier: { cella: 'CellaTEST', storages: [{ nfile: 1, id: 501 }, { nfile: 3, id: 503 }] } });
+            }
+            if (query.includes('mutation AutoGenerateMarketability')) {
+                assert.equal(variables.reportName, 'PriceCompetitivenessReport');
+                assert.deepEqual(Object.fromEntries(variables.input.map(({ key, value }) => [key, value])), {
+                    storageId: '503', rankMin: '1', rankMax: '998', clientId: '153893', uniqueOffer: 'true',
+                    popularity: 'false', soldLimit: '10', soldRange: '1',
+                    foreignStock: 'true', markupPickup: 'true', markupPickupPercent: '12.5'
+                });
+                return response({ olap: { generateReport: 'ours-3' } });
+            }
+            assert.match(query, /AutoMarketabilityResult/);
+            assert.equal(variables.workflowId, 'ours-3');
+            const ready = ++resultChecks > 1;
+            return response({ workflow: {
+                activityResult: ready ? `{result={"status":true,"resource":"${reportUrl}"}}` : null,
+                list: { items: [{ id: 'neighbour-1', status: 'COMPLETED' }, { id: 'older-3', status: 'COMPLETED' },
+                    { id: 'ours-3', status: ready ? 'COMPLETED' : 'RUNNING' }] }
+            } });
+        });
+        await page.addInitScript({ content: `
+            window.GM_xmlhttpRequest = options => {
+                const {url, data, anonymous} = options;
+                let aborted = false;
+                window.mockCrmMarketabilityRequest({url, data, anonymous}).then(result => {
+                    if (result.bytes) result.response = Uint8Array.from(result.bytes).buffer;
+                    if (!aborted) options.onload(result);
+                }, options.onerror);
+                return {abort() { aborted = true; }};
+            };
+            ${source}` });
+        await page.goto('https://admin.adeo.pro/admin/admin_pricerelevance/list?adeo-auto-price=1', { waitUntil: 'commit' });
+        await page.getByRole('checkbox', { name: 'Анализ на продаваемость' }).uncheck();
+        const importOption = page.getByRole('checkbox', { name: 'Импорт в тестовую целлу' });
+        const autoReport = page.getByRole('checkbox', { name: 'Отчёт о конкурентоспособности' });
+        assert.equal(await autoReport.isChecked(), true);
+        assert.equal(await importOption.isChecked(), true);
+        assert.equal(await importOption.isDisabled(), true);
+        await autoReport.uncheck();
+        assert.equal(await importOption.isEnabled(), true);
+        await importOption.uncheck();
+        await autoReport.check();
+        assert.equal(await importOption.isChecked(), true);
+        assert.equal(await importOption.isDisabled(), true);
+        await page.getByLabel('Тестовая ячейка').selectOption('3');
+        const foreign = page.getByRole('checkbox', { name: 'Включать в анализ прайсы заграничных складов' });
+        const markup = page.getByRole('checkbox', { name: 'Добавить наценку ко всем позициям в прайсе' });
+        assert.equal(await foreign.isChecked(), false);
+        assert.equal(await markup.isChecked(), false);
+        await foreign.check();
+        await markup.check();
+        const percent = page.getByLabel('Наценка, %');
+        assert.equal(await percent.inputValue(), '10');
+        await percent.fill('12.5');
+        await page.locator('input[type=file]').setInputFiles({ name: 'price.xlsx', mimeType: 'application/octet-stream', buffer: Buffer.from('excel') });
+        const button = page.getByRole('button', { name: 'Запустить' });
+        assert.equal(importId, 0);
+        await button.click();
+        await page.getByText('Отчёт не запущен. ADEO не подтвердил успешный импорт.', { exact: true }).waitFor();
+        assert.equal(crmCalls.length, 0);
+        await button.click();
+        await page.getByText('Импорт выполняется.', { exact: true }).waitFor();
+        assert.equal(crmCalls.length, 0);
+        importReady = true;
+        await page.getByText('Отчёт по CellaTEST/3 готов. Задание CRM: ours-3.', { exact: true }).waitFor();
+        assert.deepEqual(await page.locator('.adeo-marketability-metric strong').allTextContents(),
+            ['1', '0', '1', '0', '2', '50,00%', '—', '—']);
+        assert.equal(await page.getByRole('link', { name: 'Скачать исходный отчёт' }).getAttribute('href'), reportUrl);
+        assert.equal(crmCalls.filter(call => call.data?.includes('mutation AutoGenerateMarketability')).length, 1);
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
 test('Конкурентоспособность: уникальные позиции отделены от топ-1, служебная строка не считается', () => {
     const data = [headers, position(1), position(2), position(3), position(4), ['Уникальные позиции'], position(1), position(1)];
     const result = calculate(data);

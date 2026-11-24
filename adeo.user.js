@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADEO — прайсы и расписание поставщиков
 // @namespace    admin.adeo.pro
-// @version      3.6.3
+// @version      3.7.0
 // @description  Работа с прайсами и мастер расписания поставщиков CRM
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
@@ -19,12 +19,26 @@
 // @sandbox      raw
 // @grant        GM_registerMenuCommand
 // @grant        GM_openInTab
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
+// @connect      crm.adeo.pro
+// @connect      s3.adeo.pro
 // ==/UserScript==
 
 (function () {
     'use strict';
 
     const SROKI_URL = 'https://192.168.3.19:6001/sroki';
+    const PRICE_RELEVANCE_PATH = '/admin/admin_pricerelevance/list';
+    const TEST_PRICE_SUPPLIER = '43068';
+    const TEST_PRICE_CELL_KEY = 'autoPriceTestCell';
+    const CRM_MARKETABILITY_API = 'https://crm.adeo.pro/svc-platform-v1/graphql';
+    const CRM_REPORT_ORIGIN = 'https://s3.adeo.pro';
+    const CRM_REPORT_MAX_BYTES = 50 * 1024 * 1024;
+    const AUTO_PRICE_CHECK_TITLE = 'Авто проверка прайса';
+    const AUTO_PRICE_CHECK_PARAM = 'adeo-auto-price';
+    const RELEVANCE_DEFAULTS = { outStart: '5', orders_avg_cost: false, orders_max_cost: false };
     const PAGE_SIZES = [10, 50, 100, 500, 1000, 3000, 5000, 10000, 100000];
     const initializedFields = new WeakSet();
     const filteredRowDisplays = new WeakMap();
@@ -37,7 +51,7 @@
         started: null, finished: null, warning: '', links: [], revision: 0, uploading: false, notify() {} };
     const relevanceAnalysis = { phase: 'idle', revision: 0, armed: false, accepted: false, token: 0,
         percent: null, message: '', result: null, started: null, finished: null, worker: null,
-        controller: null, blob: null, blobUrl: '', fileName: '', source: '', timer: null };
+        controller: null, blob: null, blobUrl: '', fileName: '', source: '', timer: null, reportTask: null };
     let quickLinksInstalled = false;
 
     function parseQuickPriceReference(value) {
@@ -71,7 +85,8 @@
         if (window.top && window.top !== window.self) return;
         quickLinksInstalled = true;
         const links = [
-            ['Анализ прайса на продаваемость', 'https://admin.adeo.pro/admin/admin_pricerelevance/list'],
+            [AUTO_PRICE_CHECK_TITLE, `https://admin.adeo.pro${PRICE_RELEVANCE_PATH}?${AUTO_PRICE_CHECK_PARAM}=1`],
+            ['Анализ прайса на продаваемость', `https://admin.adeo.pro${PRICE_RELEVANCE_PATH}`],
             ['Анализ конкурентоспособности прайса — CRM', 'https://crm.adeo.pro/reports/marketability'],
             ['Статистика импорта прайсов', 'https://avatar.adeo.pro/istat.php'],
             ['Поставщики и расписание — CRM', 'https://crm.adeo.pro/supplier/supplier-list']
@@ -143,22 +158,39 @@
         }
     }
 
-    // Используем местную дату и ограничиваем день последним днём предыдущего месяца.
-    function getPreviousMonthDate(now = new Date()) {
+    function formatPriceDate(date) {
+        return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+    }
+
+    // Используем местную дату и ограничиваем день последним днём нужного месяца.
+    function getPreviousMonthDate(now = new Date(), months = 1) {
         const date = new Date(now.getFullYear(), now.getMonth(), 1);
-        date.setMonth(date.getMonth() - 1);
+        date.setMonth(date.getMonth() - months);
         const lastDay = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
         date.setDate(Math.min(now.getDate(), lastDay));
-        return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+        return formatPriceDate(date);
+    }
+
+    function getAutoPriceStartDate(period, customStart, now = new Date()) {
+        if (period === 'custom') return customStart;
+        if (period === 'half-year') return getPreviousMonthDate(now, 6);
+        if (period === 'year') return getPreviousMonthDate(now, 12);
+        const start = new Date(now);
+        start.setDate(start.getDate() - Number(period));
+        return formatPriceDate(start);
+    }
+
+    function isRelevanceFile(file) {
+        return Boolean(file && /\.(xlsx|xls)$/i.test(file.name) && file.size > 0);
     }
 
     function initPriceRelevance() {
         observePage(() => {
             setFileAcceptAttribute('input[type="file"][name="price"]');
-            fillFieldOnce('input[name="outStart"]', '5');
+            fillFieldOnce('input[name="outStart"]', RELEVANCE_DEFAULTS.outStart);
             fillFieldOnce('input[name="start_date"]', getPreviousMonthDate());
-            setCheckboxOnce(document.querySelector('input[name="orders_avg_cost"]'), false);
-            setCheckboxOnce(document.querySelector('input[name="orders_max_cost"]'), false);
+            setCheckboxOnce(document.querySelector('input[name="orders_avg_cost"]'), RELEVANCE_DEFAULTS.orders_avg_cost);
+            setCheckboxOnce(document.querySelector('input[name="orders_max_cost"]'), RELEVANCE_DEFAULTS.orders_max_cost);
             enhancePriceRelevance();
         });
     }
@@ -191,26 +223,39 @@
         return text;
     }
 
-    function applyRelevanceMessage(html, inProcess) {
+    function readRelevanceMessage(html) {
         const template = document.createElement('template');
         template.innerHTML = decodeRelevanceMessage(html);
         const message = template.content.textContent.trim();
         const parsed = parseRelevanceStatus(message);
-        const state = relevanceProgress;
-        Object.assign(state, parsed, { message, warning: '', links: [] });
+        const links = [];
         // Переносим только текст и безопасные ссылки результата, сохраняя штатное скачивание.
         template.content.querySelectorAll('a[href]').forEach(link => {
             try {
                 const url = new URL(link.getAttribute('href'), window.location.href);
                 if (url.origin === window.location.origin && /^https?:$/.test(url.protocol)) {
-                    state.links.push({ href: url.href, text: link.textContent.trim() || 'Загрузить результат' });
+                    links.push({ href: url.href, text: link.textContent.trim() || 'Загрузить результат' });
                 }
             } catch { /* Некорректная ссылка не должна мешать обновлению статуса. */ }
         });
-        const active = ['queued', 'processing', 'preparing'].includes(state.stage);
-        if (state.revision > 0 && relevanceAnalysis.armed && (active || inProcess === true)) relevanceAnalysis.accepted = true;
+        return { ...parsed, message, links };
+    }
+
+    function relevanceServerBusy(stage, inProcess) {
+        return inProcess === true || ['queued', 'processing', 'preparing'].includes(stage);
+    }
+
+    function applyRelevanceMessage(html, inProcess) {
+        applyRelevanceStatus(readRelevanceMessage(html), inProcess);
+    }
+
+    function applyRelevanceStatus(parsed, inProcess) {
+        const state = relevanceProgress;
+        Object.assign(state, parsed, { warning: '' });
+        const busy = relevanceServerBusy(state.stage, inProcess);
+        if (state.revision > 0 && relevanceAnalysis.armed && busy) relevanceAnalysis.accepted = true;
         // В очереди сервер возвращает inProcess=false: это ещё не завершение задания.
-        state.busy = active || inProcess === true;
+        state.busy = busy;
         if (state.busy && !state.started) state.started = Date.now();
         if (state.busy) state.finished = null;
         else if (state.started && !state.finished) state.finished = Date.now();
@@ -218,7 +263,7 @@
         state.notify();
         if (state.stage === 'done' && !state.busy && relevanceAnalysis.armed && relevanceAnalysis.accepted && state.links.length) {
             relevanceAnalysis.armed = false;
-            void startRelevanceAnalysis();
+            relevanceAnalysis.reportTask = startRelevanceAnalysis();
         }
     }
 
@@ -244,7 +289,7 @@
         if (analysis.blobUrl) URL.revokeObjectURL(analysis.blobUrl);
         Object.assign(analysis, { phase: 'idle', revision: relevanceProgress.revision, armed: true, accepted: false,
             percent: null, message: '', result: null, started: null, finished: null, blob: null, blobUrl: '', source: '',
-            fileName: '', sourceName: body?.get?.('price')?.name || '', outputStart: body?.get?.('outStart') ?? null });
+            fileName: '', reportTask: null, sourceName: body?.get?.('price')?.name || '', outputStart: body?.get?.('outStart') ?? null });
     }
 
     // Эта функция выполняется в отдельном потоке; денежные операции повторяют Decimal в ARM.
@@ -515,10 +560,10 @@
                     } else {
                         state.uploading = false;
                         const message = this.responseType === 'json' ? this.response : this.responseText;
-                        const template = document.createElement('template'); template.innerHTML = decodeRelevanceMessage(message);
+                        const parsed = readRelevanceMessage(message);
                         // Готовность из ответа самого POST относится к новому заданию.
-                        if (parseRelevanceStatus(template.content.textContent).stage === 'done') relevanceAnalysis.accepted = true;
-                        applyRelevanceMessage(message);
+                        if (parsed.stage === 'done') relevanceAnalysis.accepted = true;
+                        applyRelevanceStatus(parsed);
                         if (state.stage === 'unknown' || state.stage === 'idle') {
                             Object.assign(state, { stage: 'queued', busy: true, message: state.message || 'Файл отправлен. Ожидаем обработку…', finished: null });
                             state.notify();
@@ -534,15 +579,815 @@
         };
     }
 
+    async function getAutoPriceResponse(path, signal, headers) {
+        const response = await fetch(path, {
+            credentials: 'same-origin', cache: 'no-store', headers,
+            signal: AbortSignal.any([signal, AbortSignal.timeout(15000)])
+        });
+        if (!response.ok) throw new Error(`Ошибка ADEO: HTTP ${response.status}.`);
+        return response;
+    }
+
+    async function getAutoPriceStatus(signal) {
+        const response = await getAutoPriceResponse('/admin/admin_pricerelevance/state', signal, {
+            'X-Requested-With': 'XMLHttpRequest'
+        });
+        const data = await response.json().catch(() => null);
+        if (typeof data?.message !== 'string' || typeof data.inProcess !== 'boolean') {
+            throw new Error('ADEO не вернул статус проверки. Проверьте, что вы вошли в ADEO.');
+        }
+        return { status: readRelevanceMessage(data.message), inProcess: data.inProcess };
+    }
+
+    async function getAutoPriceForm(file, startDate, signal) {
+        const response = await getAutoPriceResponse(PRICE_RELEVANCE_PATH, signal);
+        // Читаем исходные значения и скрытые поля формы без запуска скриптов ADEO.
+        const source = document.createElement('template');
+        source.innerHTML = await response.text();
+        const form = source.content.querySelector('#price-form');
+        if (!form?.querySelector('input[type=file][name=price]')) {
+            throw new Error('ADEO не вернул форму проверки. Проверьте, что вы вошли в ADEO.');
+        }
+        for (const [name, value] of Object.entries({ ...RELEVANCE_DEFAULTS, start_date: startDate })) {
+            const field = form.querySelector(`input[name="${name}"]`);
+            if (!field) continue;
+            if (typeof value === 'boolean') field.checked = value;
+            else field.value = value;
+        }
+        const body = new FormData(form);
+        body.set('price', file);
+        return body;
+    }
+
+    function uploadAutoPrice(body, signal) {
+        return new Promise(resolve => {
+            const request = new XMLHttpRequest();
+            request.open('POST', PRICE_RELEVANCE_PATH);
+            request.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+            request.timeout = 120000;
+            const abort = () => request.abort();
+            signal.addEventListener('abort', abort, { once: true });
+            try {
+                request.send(body);
+            } catch (error) {
+                signal.removeEventListener('abort', abort);
+                throw error;
+            }
+            // Сначала штатный обработчик скрипта разбирает ответ на отправку.
+            request.addEventListener('loadend', () => {
+                signal.removeEventListener('abort', abort);
+                resolve();
+            }, { once: true });
+        });
+    }
+
+    async function followAutoPriceCheck(previous, signal) {
+        const state = relevanceProgress;
+        let sawActive = false;
+        let lastConfirmed = Date.now();
+        while (state.busy && !signal.aborted && Date.now() - lastConfirmed < 60000) {
+            let response;
+            try {
+                response = await getAutoPriceStatus(signal);
+            } catch (error) {
+                if (signal.aborted) return;
+                state.warning = `${error.message} Повторная проверка статуса — автоматически.`;
+                state.notify();
+            }
+            if (signal.aborted) return;
+            if (response) {
+                const { status, inProcess } = response;
+                const active = relevanceServerBusy(status.stage, inProcess);
+                // До первого активного статуса сервер может ещё отдавать предыдущий отчёт.
+                const sameResult = status.message === previous.message &&
+                    status.links[0]?.href === previous.links[0]?.href;
+                if (active) {
+                    sawActive = true;
+                    lastConfirmed = Date.now();
+                    applyRelevanceStatus(status, inProcess);
+                } else if ((sawActive || !sameResult) &&
+                    (status.stage === 'error' || (status.stage === 'done' && status.links.length))) {
+                    relevanceAnalysis.accepted = true;
+                    applyRelevanceStatus(status, false);
+                }
+            }
+            if (state.busy) await new Promise(resolve => setTimeout(resolve, 2500));
+        }
+        if (state.busy && !signal.aborted) {
+            relevanceAnalysis.armed = false;
+            Object.assign(state, { stage: 'error', busy: false, percent: null, finished: Date.now(), links: [],
+                message: 'Не удалось подтвердить завершение проверки в ADEO. Проверьте статус задания перед повторной отправкой.' });
+            state.notify();
+        }
+    }
+
+    async function requestTestPriceJson(path, signal, body) {
+        const response = await fetch(path, {
+            method: 'POST', body, credentials: 'same-origin', cache: 'no-store',
+            headers: { 'X-Requested-With': 'XMLHttpRequest' },
+            signal: AbortSignal.any([signal, AbortSignal.timeout(body ? 120000 : 15000)])
+        });
+        if (!response.ok) throw new Error(`Ошибка ADEO: HTTP ${response.status}.`);
+        const data = await response.json().catch(() => null);
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw new Error('ADEO вернул неожиданный ответ. Проверьте, что вы вошли в ADEO.');
+        }
+        return data;
+    }
+
+    async function getTestPriceImportState(jobId, signal) {
+        const job = await requestTestPriceJson(`/admin/piqueue/item/info/${jobId}`, signal);
+        const state = Number(job.state);
+        if (job.state == null || !Number.isInteger(state)) {
+            throw new Error('ADEO не вернул статус задания импорта.');
+        }
+        return { active: state === 1 || state === 2, info: job.info };
+    }
+
+    async function getTestPriceQueueJobId(target, signal) {
+        const queue = await requestTestPriceJson(`/admin/piqueue/cella/inqueue/${target}`, signal);
+        const jobId = Number(queue.job_id ?? 0);
+        if (!Number.isSafeInteger(jobId)) throw new Error('ADEO вернул неизвестный номер задания импорта.');
+        return jobId;
+    }
+
+    async function isTestPriceImportActive(target, signal) {
+        const jobId = await getTestPriceQueueJobId(target, signal);
+        return jobId > 0 && (await getTestPriceImportState(jobId, signal)).active;
+    }
+
+    function readTestPriceImportInfo(info) {
+        const template = document.createElement('template');
+        template.innerHTML = typeof info === 'string' ? info : '';
+        return template.content.textContent.trim();
+    }
+
+    function readTestPriceJsonp(callback, signal, { href, source }) {
+        return new Promise((resolve, reject) => {
+            signal.throwIfAborted();
+            const frame = document.createElement('iframe');
+            frame.hidden = true;
+            frame.setAttribute('sandbox', 'allow-scripts');
+            const quote = value => JSON.stringify(value).replaceAll('<', '\\u003c');
+            // JSONP выполняется в документе без доступа к странице ADEO.
+            const load = href ? `script.src = ${quote(href)};` : `script.text = ${quote(source)};`;
+            frame.srcdoc = `<script>
+                const send = value => parent.postMessage(value, ${quote(window.location.origin)});
+                window[${quote(callback)}] = send;
+                const script = document.createElement('script');
+                ${load}
+                script.onload = script.onerror = () => send(null);
+                document.head.append(script);
+                ${href ? '' : 'send(null);'}
+            </script>`;
+            function cleanup() {
+                window.removeEventListener('message', receive);
+                signal.removeEventListener('abort', abort);
+                frame.remove();
+            }
+            function receive(event) {
+                if (event.source !== frame.contentWindow || event.origin !== 'null') return;
+                cleanup();
+                resolve(event.data);
+            }
+            function abort() {
+                cleanup();
+                reject(signal.reason);
+            }
+            window.addEventListener('message', receive);
+            signal.addEventListener('abort', abort, { once: true });
+            document.body.append(frame);
+        });
+    }
+
+    async function confirmTestPriceImport(value, path, signal) {
+        if (typeof value !== 'string' || !value.trim()) throw new Error('ADEO не вернул адрес подтверждения импорта.');
+        const url = new URL(value, new URL(path, window.location.origin));
+        if (url.protocol !== 'https:' || url.username || url.password) {
+            throw new Error('ADEO вернул недопустимый адрес подтверждения импорта.');
+        }
+        url.hash = '';
+        const callback = 'adeoConfirmTestPriceImport';
+        const withCallback = url.href.replace(/(=)\?(?=&|$)|\?\?/, `$1${callback}`);
+        const href = withCallback === url.href ? `${url.href}${url.search ? '&' : '?'}callback=${callback}` : withCallback;
+        const timeout = AbortSignal.any([signal, AbortSignal.timeout(30000)]);
+        if (url.origin !== window.location.origin) return readTestPriceJsonp(callback, timeout, { href });
+
+        const response = await fetch(href, { credentials: 'same-origin', cache: 'no-store', signal: timeout });
+        if (!response.ok) throw new Error(`Не удалось подтвердить импорт: HTTP ${response.status}.`);
+        const text = (await response.text()).trim();
+        const jsonp = text.match(/^(?:\/\*\*\/\s*)?adeoConfirmTestPriceImport\s*\(([\s\S]*)\)\s*;?$/);
+        try { return JSON.parse(jsonp ? jsonp[1] : text); }
+        catch {
+            if (jsonp) return readTestPriceJsonp(callback, timeout, { source: text });
+            throw new Error('ADEO вернул неизвестный ответ при подтверждении импорта.');
+        }
+    }
+
+    function renderTestPriceImportLog(results, html) {
+        const source = document.createElement('template');
+        source.innerHTML = html;
+        const entries = Array.from(source.content.querySelectorAll('.gen_td'), cell => {
+            const summary = cell.querySelector('summary');
+            return { text: (summary ?? cell).textContent.trim(), details: summary?.parentElement };
+        });
+        const rows = entries.length ? entries : source.content.textContent.split(/\r?\n/).map(text => ({ text: text.trim() }));
+        const grid = document.createElement('div');
+        grid.className = 'adeo-analysis-grid';
+        const heading = document.createElement('h3');
+        heading.textContent = 'Ошибки и пропуски';
+        const issues = document.createElement('div');
+        issues.className = 'adeo-auto-price-import-errors';
+        const metrics = [
+            ['Всего строк', /^(?:Импорт окончен\.\s*)?(?:Строк всего|Всего строк)\s*:\s*/i],
+            ['Импортировано строк', /^Импортировано(?:\s+строк)?\s*:\s*/i],
+            ['Отсутствует или неверный артикул', /^Отсутствует или неверный артикул\s*:\s*/i, 'details'],
+            ['Нулевые остатки', /^Нулевые остатки\s*:\s*/i, 'count'],
+            ['Неизвестных брендов', /^Неизвестных брендов\s*:\s*/i, 'details']
+        ];
+        const formatter = new Intl.NumberFormat('ru-RU');
+        for (const [label, pattern, issue] of metrics) {
+            const row = rows.findLast(entry => pattern.test(entry.text));
+            const value = row?.text.replace(pattern, '').match(/^\d+(?:[ \u00a0\u202f]\d{3})*/)?.[0];
+            const count = value ? formatter.format(BigInt(value.replace(/\s/g, ''))) : 'Нет данных';
+            if (!issue) {
+                const card = document.createElement('article');
+                const title = document.createElement('span');
+                title.textContent = label;
+                const amount = document.createElement('strong');
+                amount.textContent = count;
+                card.append(title, amount);
+                grid.append(card);
+                continue;
+            }
+            const dataRows = issue === 'details' && row?.details?.querySelectorAll('table tr');
+            if (!dataRows?.length) {
+                const line = document.createElement('p');
+                line.textContent = `${label}: ${count}`;
+                issues.append(line);
+                continue;
+            }
+            const details = document.createElement('details');
+            const summary = document.createElement('summary');
+            summary.textContent = `${label}: ${count}`;
+            const list = document.createElement('ul');
+            for (const dataRow of dataRows) {
+                const cell = dataRow.cells[1];
+                if (!cell) continue;
+                const item = document.createElement('li');
+                item.textContent = cell.textContent.trim() || 'Пустое значение';
+                list.append(item);
+            }
+            details.append(summary, list);
+            issues.append(details);
+        }
+        results.replaceChildren(grid, heading, issues);
+    }
+
+    async function showTestPriceImportLog(results, jobId, signal) {
+        results.hidden = false;
+        results.textContent = 'Загружаем журнал импорта…';
+        try {
+            const data = await requestTestPriceJson(`/admin/piqueue/item/log/${jobId}`, signal);
+            if (typeof data.log !== 'string' || !data.log.trim()) throw new Error('Журнал пуст.');
+            if (!signal.aborted) renderTestPriceImportLog(results, data.log);
+        } catch {
+            results.textContent = 'Не удалось получить журнал импорта ADEO.';
+        }
+    }
+
+    async function runTestPriceImport(file, cell, signal, status, results, onImported) {
+        const target = `${TEST_PRICE_SUPPLIER}/${cell}`;
+        const path = `/admin/supplier/price/comparemode/${target}`;
+        status.textContent = 'Проверяем очередь импорта…';
+        results.hidden = true;
+        results.replaceChildren();
+        let acceptedJob = null;
+        try {
+            await navigator.locks.request(`adeo-test-price-import-${target}`, { signal }, async () => {
+                while (!signal.aborted && await isTestPriceImportActive(target, signal)) {
+                    status.textContent = 'Тестовая ячейка занята. Импорт начнётся после её освобождения.';
+                    await new Promise(resolve => setTimeout(resolve, 5000));
+                }
+                signal.throwIfAborted();
+                status.textContent = 'Отправляем прайс в тестовую ячейку…';
+                const body = new FormData();
+                body.set('price', file);
+                const upload = await requestTestPriceJson(path, signal, body);
+                status.textContent = 'Подтверждаем задание импорта…';
+                const result = await confirmTestPriceImport(upload.url, path, signal);
+                const info = readTestPriceImportInfo(result?.info);
+                if (info) {
+                    status.textContent = info;
+                    return;
+                }
+                const jobId = Number(result?.job_id);
+                if (!Number.isSafeInteger(jobId) || jobId <= 0) throw new Error('ADEO не подтвердил создание задания импорта.');
+                acceptedJob = jobId;
+                status.textContent = `ADEO принял задание импорта №${jobId}.`;
+                while (!signal.aborted) {
+                    const job = await getTestPriceImportState(jobId, signal);
+                    const jobInfo = readTestPriceImportInfo(job.info);
+                    if (jobInfo) status.textContent = jobInfo;
+                    if (!job.active) {
+                        const imported = /^Импорт окончен\.\s*Строк(?: всего)?\s*:\s*\d+/i.test(jobInfo);
+                        const nextReport = imported ? onImported?.(jobId) : undefined;
+                        await showTestPriceImportLog(results, jobId, signal);
+                        await nextReport;
+                        return;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 5000));
+                }
+            });
+        } catch (error) {
+            if (signal.aborted) status.textContent = 'Ожидание прервано. Проверьте очередь импорта в ADEO.';
+            else if (acceptedJob) status.textContent = `ADEO принял задание импорта №${acceptedJob}. Не удалось обновить его статус.`;
+            else if (error.name === 'TimeoutError' || error.name === 'TypeError') {
+                status.textContent = 'Не удалось получить ответ от ADEO. Проверьте очередь импорта перед повторным запуском.';
+            } else status.textContent = error.message;
+        }
+    }
+
+    function requestMarketabilityResource(details, signal, timeout, maxBytes) {
+        const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeout)]);
+        return new Promise((resolve, reject) => {
+            deadline.throwIfAborted();
+            if (typeof GM_xmlhttpRequest !== 'function') throw new Error('В Tampermonkey недоступны запросы к CRM.');
+            let request;
+            const finish = (callback, value) => {
+                deadline.removeEventListener('abort', abort);
+                callback(value);
+            };
+            function abort() {
+                finish(reject, deadline.reason);
+                request?.abort();
+            }
+            request = GM_xmlhttpRequest({
+                ...details, nocache: true,
+                onload: response => finish(resolve, response),
+                onerror: () => finish(reject, new Error('Не удалось подключиться к CRM или хранилищу отчётов.')),
+                onabort: () => finish(reject, new Error('Запрос отчёта прерван.')),
+                onprogress: event => {
+                    if (maxBytes && (event.loaded > maxBytes || event.total > maxBytes)) {
+                        finish(reject, new Error('Отчёт больше 50 МБ. Его можно скачать из CRM.'));
+                        request?.abort();
+                    }
+                }
+            });
+            deadline.addEventListener('abort', abort, { once: true });
+        });
+    }
+
+    async function requestCrmMarketability(query, variables, signal) {
+        const response = await requestMarketabilityResource({
+            method: 'POST', url: CRM_MARKETABILITY_API, responseType: 'json',
+            headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+            data: JSON.stringify({ query, variables })
+        }, signal, 20000);
+        if (response.status === 401 || response.status === 403) {
+            throw new Error('CRM не подтвердила сессию. Войдите в CRM в этом браузере.');
+        }
+        if (response.status < 200 || response.status >= 300) throw new Error(`Ошибка CRM: HTTP ${response.status}.`);
+        const payload = response.response;
+        if (payload?.errors?.length) throw new Error(payload.errors[0].message || 'CRM отклонила запрос отчёта.');
+        if (!payload?.data) throw new Error('CRM вернула неожиданный ответ. Проверьте вход в CRM.');
+        return payload.data;
+    }
+
+    function decodeMarketabilityActivity(value) {
+        if (typeof value !== 'string') return value;
+        const text = value.trim();
+        const wrapped = /^\{[^{"]+(\{[\s\S]*\})\}$/.exec(text);
+        try { return JSON.parse(wrapped?.[1] ?? text); }
+        catch { return null; }
+    }
+
+    async function waitForCrmMarketability(workflowId, signal) {
+        const until = Date.now() + 20 * 60 * 1000;
+        while (Date.now() < until) {
+            const { workflow } = await requestCrmMarketability(`
+                query AutoMarketabilityResult($workflowId: String) {
+                    workflow {
+                        activityResult(workflowId: $workflowId)
+                        list(status: [ALL], workflowType: "OLAPReportWorkflow") { items { id status } }
+                    }
+                }`, { workflowId }, signal);
+            const job = workflow?.list?.items?.find(item => item.id === workflowId);
+            if (job && ['FAILED', 'CANCELED', 'TERMINATED', 'TIMED_OUT'].includes(job.status)) {
+                throw new Error('CRM завершила задание без отчёта.');
+            }
+            const activity = decodeMarketabilityActivity(workflow?.activityResult);
+            if (activity?.status === false) throw new Error(activity.message || 'CRM не сформировала отчёт.');
+            if (activity?.status === true && activity.resource && (!job || job.status === 'COMPLETED')) {
+                const url = new URL(activity.resource);
+                if (url.origin !== CRM_REPORT_ORIGIN || url.username || url.password) {
+                    throw new Error('CRM вернула неизвестный адрес исходного отчёта.');
+                }
+                return url.href;
+            }
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            signal.throwIfAborted();
+        }
+        throw new Error('CRM ещё не сформировала отчёт. Проверьте задание по его идентификатору.');
+    }
+
+    function analyzeAutoMarketability(buffer, signal, status) {
+        const deadline = AbortSignal.any([signal, AbortSignal.timeout(300000)]);
+        return new Promise((resolve, reject) => {
+            deadline.throwIfAborted();
+            const url = URL.createObjectURL(new Blob([getRelevanceWorkerSources(), '\n;\n',
+                `(${relevanceAnalysisWorker.toString()})(${calculateMarketabilityWorkbook.toString()});`], { type: 'application/javascript' }));
+            let worker;
+            try { worker = new Worker(url); }
+            finally { URL.revokeObjectURL(url); }
+            const finish = (callback, value) => {
+                deadline.removeEventListener('abort', abort);
+                worker.terminate();
+                callback(value);
+            };
+            const abort = () => finish(reject, deadline.reason);
+            deadline.addEventListener('abort', abort, { once: true });
+            worker.onerror = event => {
+                event.preventDefault();
+                finish(reject, new Error('Браузер не смог обработать Excel отчёта.'));
+            };
+            worker.onmessage = ({ data }) => {
+                if (data.phase === 'done') finish(resolve, data.result);
+                else if (data.phase === 'error') finish(reject, new Error(data.message));
+                else status.textContent = data.message;
+            };
+            worker.postMessage({ buffer }, [buffer]);
+        });
+    }
+
+    async function runAutoMarketability(cell, importId, options, signal, status, results) {
+        const target = `${TEST_PRICE_SUPPLIER}/${cell}`;
+        const ensureCurrentImport = async () => {
+            const latest = await getTestPriceQueueJobId(target, signal);
+            if (latest > 0 && latest !== importId) {
+                throw new Error(`После текущего импорта в CellaTEST/${cell} появилось другое задание. Результат нельзя связать с этим файлом.`);
+            }
+        };
+        let workflowId;
+        try {
+            status.textContent = `Подготавливаем отчёт по CellaTEST/${cell}…`;
+            const { supplier } = await requestCrmMarketability(`
+                query AutoMarketabilityStorage($supplierId: Int!) {
+                    supplier(id: $supplierId) { cella storages { nfile id } }
+                }`, { supplierId: Number(TEST_PRICE_SUPPLIER) }, signal);
+            const storages = supplier?.storages?.filter(storage => Number(storage.nfile) === Number(cell));
+            const storageId = Number(storages?.[0]?.id);
+            if (supplier?.cella !== 'CellaTEST' || storages?.length !== 1 || !Number.isSafeInteger(storageId) || storageId <= 0) {
+                throw new Error(`CRM не нашла нужный склад CellaTEST/${cell}.`);
+            }
+            await ensureCurrentImport();
+            const parameters = {
+                storageId, rankMin: 1, rankMax: 998, clientId: 153893, uniqueOffer: true,
+                popularity: false, soldLimit: 10, soldRange: 1, ...options
+            };
+            status.textContent = `Отправляем отчёт по CellaTEST/${cell} в очередь CRM…`;
+            const { olap } = await requestCrmMarketability(`
+                mutation AutoGenerateMarketability($input: [KeyValueInput!]!, $reportName: String!) {
+                    olap { generateReport(input: $input, reportName: $reportName) }
+                }`, {
+                input: Object.entries(parameters).map(([key, value]) => ({ key, value: String(value) })),
+                reportName: 'PriceCompetitivenessReport'
+            }, signal);
+            if (typeof olap?.generateReport !== 'string' || !olap.generateReport.trim()) {
+                throw new Error('CRM не вернула идентификатор задания. Проверьте очередь CRM перед новым запуском.');
+            }
+            workflowId = olap.generateReport;
+            status.textContent = `Ожидаем отчёт по CellaTEST/${cell}. Задание CRM: ${workflowId}.`;
+            const href = await waitForCrmMarketability(workflowId, signal);
+            await ensureCurrentImport();
+            const link = document.createElement('a');
+            link.href = href;
+            link.download = '';
+            link.textContent = 'Скачать исходный отчёт';
+            results.append(link);
+            results.hidden = false;
+            status.textContent = 'Получаем Excel отчёта CRM…';
+            const file = await requestMarketabilityResource({
+                method: 'GET', url: href, responseType: 'arraybuffer', anonymous: true
+            }, signal, 90000, CRM_REPORT_MAX_BYTES);
+            if (file.status < 200 || file.status >= 300) throw new Error(`CRM не передала Excel: HTTP ${file.status}.`);
+            const buffer = file.response;
+            if (buffer?.byteLength > CRM_REPORT_MAX_BYTES) throw new Error('Отчёт больше 50 МБ. Его можно скачать в Excel.');
+            const bytes = new Uint8Array(buffer ?? 0);
+            if (bytes[0] !== 0x50 || bytes[1] !== 0x4b) throw new Error('Хранилище вернуло ответ в другом формате вместо Excel.');
+            const report = await analyzeAutoMarketability(buffer, signal, status);
+            installMarketabilityStyles();
+            const metrics = document.createElement('div');
+            metrics.className = 'adeo-marketability-metrics';
+            const notes = document.createElement('div');
+            renderMarketabilitySummary(metrics, notes, report);
+            results.append(metrics, notes);
+            status.textContent = `Отчёт по CellaTEST/${cell} готов.`;
+        } catch (error) {
+            const message = error.name === 'TimeoutError' ? 'Истекло время ожидания ответа CRM.' : error.message;
+            status.textContent = signal.aborted ? 'Ожидание отчёта прервано.' : message;
+        }
+        if (workflowId) status.textContent += ` Задание CRM: ${workflowId}.`;
+    }
+
+    function openAutoPriceCheckPage() {
+        // На этапе document-start создаём собственный документ для отдельного режима проверки.
+        const root = document.createElement('html');
+        root.lang = 'ru';
+        const head = document.createElement('head');
+        head.innerHTML = '<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">';
+        root.append(head, document.createElement('body'));
+        if (document.documentElement) document.documentElement.replaceWith(root);
+        else document.replaceChildren(document.implementation.createDocumentType('html', '', ''), root);
+        document.title = AUTO_PRICE_CHECK_TITLE;
+        installQuickLinksMenu();
+        installRelevanceStyles();
+        document.body.classList.add('adeo-auto-price');
+        const main = document.createElement('main');
+        main.innerHTML = `
+            <h1>${AUTO_PRICE_CHECK_TITLE}</h1>
+            <div id="price-form">
+                <fieldset class="adeo-auto-price-settings">
+                    <legend>Настройки проверки</legend>
+                    <div class="adeo-auto-price-actions">
+                        <label><input type="checkbox" name="run-sales" checked> Анализ на продаваемость</label>
+                        <label><input type="checkbox" name="run-import" checked> Импорт в тестовую целлу</label>
+                        <label><input type="checkbox" name="run-marketability" checked> Отчёт о конкурентоспособности</label>
+                    </div>
+                    <label>Период продаваемости
+                        <select name="sales-period">
+                            <option value="30">30 дней</option>
+                            <option value="90">90 дней</option>
+                            <option value="half-year">Полгода</option>
+                            <option value="year">Год</option>
+                            <option value="custom">Свой период</option>
+                        </select>
+                    </label>
+                    <label>Тестовая ячейка
+                        <select name="test-cell">
+                            ${Array.from({ length: 10 }, (_, index) => `<option value="${index + 1}">CellaTEST/${index + 1}</option>`).join('')}
+                        </select>
+                    </label>
+                    <label class="adeo-auto-price-custom-start" hidden>Дата начала (по сегодня)
+                        <input name="sales-start" type="date" required>
+                    </label>
+                    <div class="adeo-auto-price-marketability-settings" hidden>
+                        <label><input type="checkbox" name="marketability-foreign"> Включать в анализ прайсы заграничных складов</label>
+                        <label><input type="checkbox" name="marketability-markup-enabled"> Добавить наценку ко всем позициям в прайсе</label>
+                        <label class="adeo-auto-price-markup" hidden>Наценка, %
+                            <input type="number" name="marketability-markup" value="10" step="0.1" required>
+                        </label>
+                    </div>
+                </fieldset>
+                <div class="adeo-file-card">
+                    <label class="adeo-file-info">
+                        <span class="adeo-file-name">Выберите прайс</span>
+                        <input type="file" accept=".xls,.xlsx" disabled aria-describedby="adeo-auto-price-availability">
+                    </label>
+                    <div class="adeo-file-hint">XLS или XLSX</div>
+                    <button type="button" class="adeo-auto-price-launch" disabled>Запустить</button>
+                </div>
+                <p class="adeo-file-error" role="alert" hidden></p>
+                <section class="adeo-auto-price-sales" aria-labelledby="adeo-auto-price-sales-title">
+                    <h2 id="adeo-auto-price-sales-title" class="adeo-auto-price-test">Продаваемость</h2>
+                    <p id="adeo-auto-price-availability" class="adeo-auto-price-availability" role="status"></p>
+                </section>
+                <section class="adeo-auto-price-import" aria-labelledby="adeo-auto-price-import-title">
+                    <h2 id="adeo-auto-price-import-title" class="adeo-auto-price-test">Импорт в тестовую ячейку</h2>
+                    <p class="adeo-auto-price-import-status" role="status">Ожидает запуска.</p>
+                    <section class="adeo-auto-price-import-results adeo-analysis-results" aria-label="Результат импорта" hidden></section>
+                </section>
+                <section class="adeo-auto-price-import adeo-auto-price-marketability" aria-labelledby="adeo-auto-price-marketability-title" hidden>
+                    <h2 id="adeo-auto-price-marketability-title" class="adeo-auto-price-test">Отчёт о конкурентоспособности</h2>
+                    <p class="adeo-auto-price-import-status" role="status">Ожидает запуска.</p>
+                    <section class="adeo-auto-price-import-results adeo-analysis-results" aria-label="Результат конкурентоспособности" hidden></section>
+                </section>
+            </div>`;
+        document.body.append(main);
+        const input = main.querySelector('input[type=file]');
+        const launch = main.querySelector('.adeo-auto-price-launch');
+        const settings = main.querySelector('.adeo-auto-price-settings');
+        const salesOption = settings.querySelector('[name=run-sales]');
+        const importOption = settings.querySelector('[name=run-import]');
+        const marketabilityOption = settings.querySelector('[name=run-marketability]');
+        const marketabilitySettings = settings.querySelector('.adeo-auto-price-marketability-settings');
+        const foreignStock = marketabilitySettings.querySelector('[name=marketability-foreign]');
+        const markupEnabled = marketabilitySettings.querySelector('[name=marketability-markup-enabled]');
+        const markupPercent = marketabilitySettings.querySelector('[name=marketability-markup]');
+        const period = settings.querySelector('[name=sales-period]');
+        const cellSelect = settings.querySelector('[name=test-cell]');
+        const customStart = settings.querySelector('[name=sales-start]');
+        const customStartField = customStart.closest('label');
+        const storedCell = typeof GM_getValue === 'function' ? String(GM_getValue(TEST_PRICE_CELL_KEY, '1')) : '1';
+        if (/^(?:[1-9]|10)$/.test(storedCell)) cellSelect.value = storedCell;
+        const salesSection = main.querySelector('.adeo-auto-price-sales');
+        const importSection = main.querySelector('.adeo-auto-price-import');
+        const marketabilitySection = main.querySelector('.adeo-auto-price-marketability');
+        const marketabilityStatus = marketabilitySection.querySelector('[role=status]');
+        const marketabilityResults = marketabilitySection.querySelector('.adeo-auto-price-import-results');
+        const availability = main.querySelector('#adeo-auto-price-availability');
+        const importTitle = main.querySelector('#adeo-auto-price-import-title');
+        const importStatus = main.querySelector('.adeo-auto-price-import-status');
+        const importResults = main.querySelector('.adeo-auto-price-import-results');
+        const error = main.querySelector('.adeo-file-error');
+        let reportAvailable = false;
+        let availabilityController;
+        let availabilityTimer;
+        let controller = null;
+        function syncControls() {
+            customStart.max = formatPriceDate(new Date());
+            const customPeriod = salesOption.checked && period.value === 'custom';
+            const running = Boolean(controller) || relevanceProgress.busy || relevanceAnalysisRunning();
+            const marketability = marketabilityOption.checked;
+            if (marketability) importOption.checked = true;
+            importOption.disabled = marketability;
+            marketabilitySettings.hidden = marketabilitySection.hidden = !marketability;
+            markupPercent.closest('label').hidden = !markupEnabled.checked;
+            customStartField.hidden = !customPeriod;
+            settings.disabled = running;
+            period.disabled = !salesOption.checked;
+            cellSelect.disabled = !importOption.checked;
+            salesSection.hidden = !salesOption.checked;
+            importSection.hidden = !importOption.checked;
+            input.disabled = running;
+            launch.disabled = running || !isRelevanceFile(input.files[0]) ||
+                (!salesOption.checked && !importOption.checked) ||
+                (salesOption.checked && (!reportAvailable || (customPeriod && !customStart.validity.valid))) ||
+                (marketability && markupEnabled.checked && (!markupPercent.validity.valid || !markupPercent.valueAsNumber));
+        }
+        function waitForReport(message) {
+            reportAvailable = false;
+            availability.textContent = message;
+            syncControls();
+            clearTimeout(availabilityTimer);
+            availabilityTimer = setTimeout(() => void checkReportAvailability(availabilityController.signal), 5000);
+        }
+        async function checkReportAvailability(signal) {
+            let response;
+            try {
+                response = await getAutoPriceStatus(signal);
+            } catch {
+                if (!signal.aborted) waitForReport('Не удалось проверить доступность отчёта ADEO. Пробуем снова…');
+                return null;
+            }
+            if (signal.aborted) return null;
+            if (relevanceServerBusy(response.status.stage, response.inProcess)) {
+                waitForReport('Отчёт по продаваемости занят другим файлом. Запуск станет доступен, когда отчёт освободится.');
+                return null;
+            }
+            reportAvailable = true;
+            availability.textContent = '';
+            syncControls();
+            return response.status;
+        }
+        function refreshReportAvailability() {
+            clearTimeout(availabilityTimer);
+            availabilityController?.abort();
+            reportAvailable = false;
+            availability.textContent = salesOption.checked ? 'Проверяем доступность отчёта ADEO…' : '';
+            syncControls();
+            if (salesOption.checked) {
+                availabilityController = new AbortController();
+                void checkReportAvailability(availabilityController.signal);
+            }
+        }
+        mountRelevanceProgress(availability, syncControls, 'Выберите файл и нажмите «Запустить».');
+        relevanceProgress.notify();
+        refreshReportAvailability();
+        salesOption.addEventListener('change', refreshReportAvailability);
+        importOption.addEventListener('change', syncControls);
+        marketabilityOption.addEventListener('change', syncControls);
+        markupEnabled.addEventListener('change', syncControls);
+        markupPercent.addEventListener('input', syncControls);
+        period.addEventListener('change', syncControls);
+        customStart.addEventListener('input', syncControls);
+        cellSelect.addEventListener('change', () => {
+            if (typeof GM_setValue === 'function') GM_setValue(TEST_PRICE_CELL_KEY, cellSelect.value);
+        });
+
+        input.addEventListener('change', () => {
+            const file = input.files[0];
+            error.textContent = 'Выберите непустой файл XLS или XLSX.';
+            error.hidden = !file || isRelevanceFile(file);
+            syncControls();
+        });
+
+        launch.addEventListener('click', async () => {
+            if (launch.disabled) return;
+            const file = input.files[0];
+            const runSales = salesOption.checked;
+            const runImport = importOption.checked;
+            const marketability = marketabilityOption.checked ? {
+                foreignStock: foreignStock.checked,
+                markupPickup: markupEnabled.checked,
+                markupPickupPercent: markupEnabled.checked ? markupPercent.valueAsNumber : 10
+            } : null;
+            const startDate = runSales ? getAutoPriceStartDate(period.value, customStart.value) : '';
+            const cell = cellSelect.value;
+            error.hidden = true;
+            controller = new AbortController();
+            const { signal } = controller;
+            const preparing = `Подготовка проверки файла «${file.name}»…`;
+            if (runSales) relevanceProgress.message = preparing;
+            relevanceProgress.notify();
+            let importTask;
+            const startImport = () => {
+                importTitle.textContent = `Импорт в CellaTEST/${cell}`;
+                let onImported;
+                let reportStarted = false;
+                if (marketability) {
+                    marketabilityStatus.textContent = 'Ожидаем успешного импорта в тестовую ячейку…';
+                    marketabilityResults.hidden = true;
+                    marketabilityResults.replaceChildren();
+                    onImported = jobId => {
+                        reportStarted = true;
+                        return runAutoMarketability(cell, jobId, marketability, signal, marketabilityStatus, marketabilityResults);
+                    };
+                }
+                importTask = runTestPriceImport(file, cell, signal, importStatus, importResults, onImported).finally(() => {
+                    if (marketability && !reportStarted) marketabilityStatus.textContent = 'Отчёт не запущен. ADEO не подтвердил успешный импорт.';
+                });
+            };
+            const run = async lock => {
+                if (!lock) throw new Error('В другой вкладке уже идёт автоматическая проверка прайса.');
+                const body = await getAutoPriceForm(file, startDate, signal);
+                const previous = await checkReportAvailability(signal);
+                if (!previous || signal.aborted) return;
+                if (runImport) startImport();
+                await uploadAutoPrice(body, signal);
+                if (relevanceProgress.stage === 'done' && !relevanceProgress.links.length) {
+                    Object.assign(relevanceProgress, { stage: 'preparing', busy: true, message: 'Ожидаем ссылку на отчёт ADEO…' });
+                    relevanceProgress.notify();
+                }
+                await followAutoPriceCheck(previous, signal);
+                await relevanceAnalysis.reportTask;
+            };
+            try {
+                if (runSales) await navigator.locks.request('adeo-auto-price', { ifAvailable: true }, run);
+                else startImport();
+            } catch (cause) {
+                if (!signal.aborted) {
+                    error.textContent = cause.message;
+                    error.hidden = false;
+                }
+            } finally {
+                await importTask;
+                if (relevanceProgress.message === preparing) relevanceProgress.message = '';
+                controller = null;
+                relevanceProgress.notify();
+            }
+        });
+        window.addEventListener('pagehide', () => {
+            clearTimeout(availabilityTimer);
+            availabilityController?.abort();
+            controller?.abort();
+            if (!relevanceProgress.busy) return;
+            relevanceAnalysis.armed = false;
+            Object.assign(relevanceProgress, { stage: 'error', busy: false, uploading: false, percent: null, finished: Date.now(),
+                message: 'Ожидание прервано при уходе со страницы. Проверьте статус задания в ADEO.' });
+        });
+        window.addEventListener('pageshow', event => {
+            if (event.persisted) refreshReportAvailability();
+        });
+    }
+
     function installRelevanceStyles() {
         if (document.getElementById('adeo-relevance-styles')) return;
         const style = document.createElement('style');
         style.id = 'adeo-relevance-styles';
         style.textContent = `
+            .adeo-auto-price { margin: 0; background: #edf2f7; color: #26394d; font: 15px/1.5 Arial, sans-serif; }
+            .adeo-auto-price main { width: min(1120px, calc(100% - 32px)); margin: 32px auto; }
+            .adeo-auto-price h1 { margin: 0 0 18px; font-size: clamp(24px, 4vw, 32px); }
+            .adeo-auto-price-test { margin: 0; padding: 12px 24px; font-size: 18px; }
+            .adeo-auto-price-settings { display: flex; flex-wrap: wrap; gap: 12px 20px; min-width: 0; margin: 16px 12px 0; padding: 12px; border: 1px solid #d8e0e8; border-radius: 6px; }
+            .adeo-auto-price-settings legend { padding: 0 6px; font-weight: bold; }
+            .adeo-auto-price-settings label { display: grid; gap: 4px; }
+            .adeo-auto-price-actions { display: flex; flex: 1 0 100%; flex-wrap: wrap; gap: 8px 20px; }
+            .adeo-auto-price-actions label { display: flex; align-items: center; gap: 6px; }
+            .adeo-auto-price-actions input { accent-color: #28649a; }
+            .adeo-auto-price-settings :is(select, input[type=date], input[type=number]) { box-sizing: border-box; width: 100%; min-height: 36px; padding: 4px 8px; border: 1px solid #afc3d6; border-radius: 4px; background: white; color: inherit; font: inherit; }
+            .adeo-auto-price-marketability-settings { display: grid; flex-basis: 100%; gap: 6px; }
+            .adeo-auto-price-marketability-settings label:has(input[type=checkbox]) { display: flex; align-items: center; gap: 6px; }
+            .adeo-auto-price-markup { width: 120px; }
+            .adeo-auto-price .adeo-file-info { display: grid; gap: 4px; min-width: 0; }
+            .adeo-auto-price input[type=file] { max-width: 100%; }
+            .adeo-auto-price-availability { margin: 0; padding: 0 24px 8px; color: #825019; }
+            .adeo-auto-price-availability:empty { padding: 0; }
+            .adeo-auto-price-availability:not(:empty) + .adeo-relevance-bar[data-stage=idle] { display: none; }
+            .adeo-auto-price-import { padding-bottom: 14px; border-top: 1px solid #d8e0e8; }
+            .adeo-auto-price-import-status { margin: 0; padding: 0 24px; overflow-wrap: anywhere; }
+            .adeo-auto-price-import-results { padding: 14px 24px 0; }
+            .adeo-auto-price-import-results .adeo-analysis-grid { margin-bottom: 12px; }
+            .adeo-auto-price-import-errors p { margin: 8px 0; }
+            .adeo-auto-price-import-errors details { margin-top: 8px; }
+            .adeo-auto-price-import-errors li { overflow-wrap: anywhere; }
             .adeo-relevance #price-form { border: 1px solid #d8e0e8; border-radius: 6px; background: #f8fafc; color: #26394d; }
             .adeo-relevance .adeo-relevance-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 12px; }
             .adeo-relevance #price-form button, .adeo-relevance #submitButton { box-sizing: border-box; min-height: 36px; padding: 7px 14px; border: 1px solid #c4cdd7; border-radius: 4px; background: #fff; color: #26394d; font: 14px Arial, sans-serif; cursor: pointer; }
             .adeo-relevance #price-form button:hover:not(:disabled) { background: #eaf1f8; border-color: #8faac4; }
+            .adeo-auto-price #price-form .adeo-auto-price-launch { background: #28649a; border-color: #28649a; color: white; }
+            .adeo-auto-price #price-form .adeo-auto-price-launch:hover:not(:disabled) { background: #204f7b; }
             .adeo-relevance #submitButton { background: #28649a; border-color: #28649a; color: white; }
             .adeo-relevance #price-form :disabled { opacity: .5; cursor: default; }
             .adeo-relevance #price-form :focus-visible, .adeo-relevance-bar a:focus-visible { outline: 2px solid #3274b5; outline-offset: 3px; }
@@ -600,49 +1445,10 @@
         document.body.classList.add('adeo-relevance');
     }
 
-    function enhancePriceRelevance() {
-        const form = document.querySelector('#price-form');
-        const input = form?.querySelector('input[type=file][name=price]');
-        const submit = form?.querySelector('#submitButton');
-        const status = document.querySelector('#status');
-        if (!form || !input || !submit || !status || form.dataset.adeoRelevance) return;
-        form.dataset.adeoRelevance = 'true';
-        installRelevanceStyles();
+    function mountRelevanceProgress(anchor, syncControls, idleMessage) {
         const element = (tag, className, text = '') => {
             const node = document.createElement(tag); node.className = className; node.textContent = text; return node;
         };
-        const settings = element('div', 'adeo-relevance-settings');
-        settings.id = 'adeo-relevance-settings'; settings.hidden = true;
-        // Перемещаем исходные поля вместе с обёртками iCheck и обработчиками сайта.
-        const fileGroup = input.closest('.form-group');
-        input.hidden = true;
-        const card = element('div', 'adeo-file-card');
-        const info = element('div', 'adeo-file-info');
-        const fileName = element('div', 'adeo-file-name', 'Выберите прайс для анализа');
-        const fileHint = element('div', 'adeo-file-hint', 'XLS или XLSX · Можно перетащить файл в любое место страницы');
-        info.append(fileName, fileHint);
-        const choose = createButton('Выбрать файл', () => input.click(), 'adeo-file-choose');
-        const remove = createButton('Убрать', () => { input.value = ''; input.dispatchEvent(new Event('change', { bubbles: true })); }, 'adeo-file-remove');
-        card.append(input, choose, info, remove);
-        fileGroup?.remove();
-        const tools = element('div', 'adeo-relevance-tools');
-        const toggle = createButton('Настройки', () => {
-            settings.hidden = !settings.hidden;
-            toggle.setAttribute('aria-expanded', String(!settings.hidden));
-        }, 'adeo-relevance-toggle');
-        toggle.setAttribute('aria-controls', settings.id); toggle.setAttribute('aria-expanded', 'false');
-        tools.append(submit, toggle);
-        settings.append(...Array.from(form.children));
-        settings.querySelectorAll('input[name]').forEach(field => {
-            if (!field.id) field.id = `adeo-relevance-${field.name}`;
-            const label = field.closest('.form-group')?.querySelector('label');
-            if (label) label.htmlFor = field.id;
-        });
-        const error = element('p', 'adeo-file-error'); error.setAttribute('role', 'alert'); error.hidden = true;
-        form.append(card, error, tools, settings);
-        const overlay = element('div', 'adeo-relevance-drop', 'Отпустите один файл XLS или XLSX для выбора');
-        overlay.hidden = true; document.body.append(overlay);
-
         const bar = element('section', 'adeo-relevance-bar');
         bar.setAttribute('aria-label', 'Ход анализа прайса');
         const head = element('div', 'adeo-relevance-head');
@@ -662,29 +1468,8 @@
         actions.append(analyze, cancel);
         const resultActions = element('div', 'adeo-result-actions'); resultActions.append(links, actions);
         const results = element('div', 'adeo-analysis-results'); results.hidden = true;
-        bar.append(head, steps, track, message, warning, resultActions, results); tools.after(bar);
-        const originalStatusBox = status.closest('.container-fluid');
-        if (originalStatusBox && !originalStatusBox.contains(form)) originalStatusBox.hidden = true;
-        else status.hidden = true;
-
+        bar.append(head, steps, track, message, warning, resultActions, results); anchor.after(bar);
         const state = relevanceProgress;
-        function showError(text) { error.textContent = text; error.hidden = !text; }
-        function validFile(file) { return file && /\.(xlsx|xls)$/i.test(file.name) && file.size > 0; }
-        function updateFile() {
-            const file = input.files[0];
-            fileName.textContent = file?.name || 'Выберите прайс для анализа';
-            fileHint.textContent = file ? `${new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 }).format(file.size / 1024)} КБ · XLS или XLSX` : 'XLS или XLSX · Можно перетащить файл в любое место страницы';
-            remove.hidden = !file;
-            choose.textContent = file ? 'Заменить файл' : 'Выбрать файл';
-            showError(file && !validFile(file) ? 'Нужен непустой файл в формате XLS или XLSX.' : '');
-            syncControls();
-        }
-        function syncControls() {
-            const locked = state.busy || state.uploading || relevanceAnalysisRunning();
-            const disabled = locked || !validFile(input.files[0]);
-            if (submit.disabled !== disabled) submit.disabled = disabled;
-            choose.disabled = remove.disabled = input.disabled = locked;
-        }
         const titles = { idle: 'Готово к проверке', uploading: 'Отправка файла', queued: 'Ожидание обработки',
             processing: 'Обработка строк', preparing: 'Подготовка результата', done: 'Файл сформирован', error: 'Ошибка проверки', unknown: 'Статус проверки' };
         let renderedResult = null;
@@ -735,7 +1520,7 @@
             const titleText = `${showAnalysis ? analysisTitles[analysis.phase] : oldResult ? 'Предыдущий результат готов' : titles[state.stage]}${percentage}`;
             bar.dataset.analysisPhase = analysis.phase;
             if (title.textContent !== titleText) title.textContent = titleText;
-            message.textContent = showAnalysis ? analysis.message : oldResult ? 'Доступен результат прошлого запуска. Можно скачать или проанализировать его. Новый файл будет проанализирован автоматически после формирования.' : state.message || 'Выберите файл и нажмите «Сформировать».';
+            message.textContent = showAnalysis ? analysis.message : oldResult ? 'Доступен результат прошлого запуска. Можно скачать или проанализировать его. Новый файл будет проанализирован автоматически после формирования.' : state.message || idleMessage;
             warning.textContent = state.warning;
             track.hidden = !state.busy && !active;
             track.classList.toggle('adeo-indeterminate', percent === null);
@@ -768,10 +1553,87 @@
             time.textContent = [total, local].filter(Boolean).join(' · ');
         }
         state.notify = render;
+        let timer = setInterval(updateTime, 1000);
+        window.addEventListener('pagehide', event => {
+            clearInterval(timer);
+            if (relevanceAnalysisRunning()) stopRelevanceAnalysis('Анализ прерван при уходе со страницы. Его можно запустить повторно.');
+            if (!event.persisted && relevanceAnalysis.blobUrl) { URL.revokeObjectURL(relevanceAnalysis.blobUrl); relevanceAnalysis.blobUrl = ''; }
+        });
+        window.addEventListener('pageshow', event => {
+            if (!event.persisted) return;
+            timer = setInterval(updateTime, 1000); render();
+        });
+    }
+
+    function enhancePriceRelevance() {
+        const form = document.querySelector('#price-form');
+        const input = form?.querySelector('input[type=file][name=price]');
+        const submit = form?.querySelector('#submitButton');
+        const status = document.querySelector('#status');
+        if (!form || !input || !submit || !status || form.dataset.adeoRelevance) return;
+        form.dataset.adeoRelevance = 'true';
+        installRelevanceStyles();
+        const element = (tag, className, text = '') => {
+            const node = document.createElement(tag); node.className = className; node.textContent = text; return node;
+        };
+        const settings = element('div', 'adeo-relevance-settings');
+        settings.id = 'adeo-relevance-settings'; settings.hidden = true;
+        // Перемещаем исходные поля вместе с обёртками iCheck и обработчиками сайта.
+        const fileGroup = input.closest('.form-group');
+        input.hidden = true;
+        const card = element('div', 'adeo-file-card');
+        const info = element('div', 'adeo-file-info');
+        const fileName = element('div', 'adeo-file-name', 'Выберите прайс для анализа');
+        const fileHint = element('div', 'adeo-file-hint', 'XLS или XLSX · Можно перетащить файл в любое место страницы');
+        info.append(fileName, fileHint);
+        const choose = createButton('Выбрать файл', () => input.click(), 'adeo-file-choose');
+        const remove = createButton('Убрать', () => { input.value = ''; input.dispatchEvent(new Event('change', { bubbles: true })); }, 'adeo-file-remove');
+        card.append(input, choose, info, remove);
+        fileGroup?.remove();
+        const tools = element('div', 'adeo-relevance-tools');
+        const toggle = createButton('Настройки', () => {
+            settings.hidden = !settings.hidden;
+            toggle.setAttribute('aria-expanded', String(!settings.hidden));
+        }, 'adeo-relevance-toggle');
+        toggle.setAttribute('aria-controls', settings.id); toggle.setAttribute('aria-expanded', 'false');
+        tools.append(submit, toggle);
+        settings.append(...Array.from(form.children));
+        settings.querySelectorAll('input[name]').forEach(field => {
+            if (!field.id) field.id = `adeo-relevance-${field.name}`;
+            const label = field.closest('.form-group')?.querySelector('label');
+            if (label) label.htmlFor = field.id;
+        });
+        const error = element('p', 'adeo-file-error'); error.setAttribute('role', 'alert'); error.hidden = true;
+        form.append(card, error, tools, settings);
+        const overlay = element('div', 'adeo-relevance-drop', 'Отпустите один файл XLS или XLSX для выбора');
+        overlay.hidden = true; document.body.append(overlay);
+
+        const originalStatusBox = status.closest('.container-fluid');
+        if (originalStatusBox && !originalStatusBox.contains(form)) originalStatusBox.hidden = true;
+        else status.hidden = true;
+
+        const state = relevanceProgress;
+        function showError(text) { error.textContent = text; error.hidden = !text; }
+        function updateFile() {
+            const file = input.files[0];
+            fileName.textContent = file?.name || 'Выберите прайс для анализа';
+            fileHint.textContent = file ? `${new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 }).format(file.size / 1024)} КБ · XLS или XLSX` : 'XLS или XLSX · Можно перетащить файл в любое место страницы';
+            remove.hidden = !file;
+            choose.textContent = file ? 'Заменить файл' : 'Выбрать файл';
+            showError(file && !isRelevanceFile(file) ? 'Нужен непустой файл в формате XLS или XLSX.' : '');
+            syncControls();
+        }
+        function syncControls() {
+            const locked = state.busy || state.uploading || relevanceAnalysisRunning();
+            const disabled = locked || !isRelevanceFile(input.files[0]);
+            if (submit.disabled !== disabled) submit.disabled = disabled;
+            choose.disabled = remove.disabled = input.disabled = locked;
+        }
+        mountRelevanceProgress(tools, syncControls, 'Выберите файл и нажмите «Сформировать».');
         if (!state.message) applyRelevanceMessage(status.innerHTML, submit.disabled);
         input.addEventListener('change', updateFile);
         form.addEventListener('submit', event => {
-            if (state.busy || relevanceAnalysisRunning() || !validFile(input.files[0])) {
+            if (state.busy || relevanceAnalysisRunning() || !isRelevanceFile(input.files[0])) {
                 event.preventDefault(); event.stopImmediatePropagation();
                 if (!state.busy) showError('Выберите непустой файл XLS или XLSX.');
             }
@@ -798,7 +1660,7 @@
             event.preventDefault(); clearDrag();
             if (state.busy || relevanceAnalysisRunning()) return;
             const files = event.dataTransfer.files;
-            if (files.length !== 1 || !validFile(files[0])) { showError('Перетащите один непустой файл XLS или XLSX.'); return; }
+            if (files.length !== 1 || !isRelevanceFile(files[0])) { showError('Перетащите один непустой файл XLS или XLSX.'); return; }
             try {
                 input.files = files;
                 input.dispatchEvent(new Event('change', { bubbles: true }));
@@ -806,18 +1668,11 @@
         });
         window.addEventListener('blur', clearDrag);
         document.addEventListener('dragend', clearDrag);
-        let timer = setInterval(updateTime, 1000);
-        window.addEventListener('pagehide', event => {
-            clearInterval(timer); observer.disconnect(); clearDrag();
-            if (relevanceAnalysisRunning()) stopRelevanceAnalysis('Анализ прерван при уходе со страницы. Его можно запустить повторно.');
-            if (!event.persisted && relevanceAnalysis.blobUrl) { URL.revokeObjectURL(relevanceAnalysis.blobUrl); relevanceAnalysis.blobUrl = ''; }
-        });
+        window.addEventListener('pagehide', () => { observer.disconnect(); clearDrag(); });
         window.addEventListener('pageshow', event => {
-            if (!event.persisted) return;
-            observer.observe(submit, { attributes: true, attributeFilter: ['disabled'] });
-            timer = setInterval(updateTime, 1000); render();
+            if (event.persisted) observer.observe(submit, { attributes: true, attributeFilter: ['disabled'] });
         });
-        updateFile(); render();
+        updateFile(); state.notify();
     }
 
     function updateTextStyle(element) {
@@ -2668,6 +3523,41 @@
             meta: { sheet: structure.name, invalidRows: invalid, scannedRows: rows }, warnings };
     }
 
+    function renderMarketabilitySummary(metrics, notes, report) {
+        metrics.replaceChildren();
+        notes.replaceChildren();
+        if (!report) return;
+        const element = (tag, className, text = '') => {
+            const node = document.createElement(tag);
+            node.className = className;
+            node.textContent = text;
+            return node;
+        };
+        const data = report.result;
+        const formatter = new Intl.NumberFormat('ru-RU');
+        const number = value => value === null ? '—' : formatter.format(value);
+        const items = [['Топ 1', number(data.top1)], ['Уник', number(data.unique)], ['Топ 2', number(data.top2)], ['Топ 3', number(data.top3)],
+            ['Всего строк', number(data.total)], ['% прохождения', `${data.percent.replace('.', ',')}%`],
+            ['Скидка строк', number(data.discountRows)], ['Убрать строк', number(data.removeRows)]];
+        items.forEach(([label, value], index) => {
+            const metric = element('article', 'adeo-marketability-metric');
+            metric.append(element('span', '', label), element('strong', '', value));
+            if (index === 5) metric.dataset.target = data.meetsTarget ? 'met' : 'below';
+            if (index === 6) metric.title = 'Сколько позиций нужно улучшить до топ-1, чтобы достичь 30% прохождения.';
+            if (index === 7) metric.title = 'Сколько непроходящих позиций нужно исключить, чтобы достичь 30% прохождения.';
+            metrics.append(metric);
+        });
+        notes.append(element('div', 'adeo-marketability-note', `Цель: 30%. Прохождение = (Топ 1 + Уник) / Всего строк. ${data.meetsTarget ? 'Целевой порог достигнут.' : '«Скидка строк» и «Убрать строк» — альтернативные способы достичь цели.'} Уникальные позиции не включены повторно в Топ 1. Лист: ${report.meta.sheet}.`));
+        if (report.warnings.length) {
+            const details = element('details', '');
+            details.append(element('summary', '', `Замечания к позициям: ${number(report.meta.invalidRows)}`));
+            const list = element('ul', '');
+            report.warnings.forEach(text => list.append(element('li', '', text)));
+            details.append(list);
+            notes.append(details);
+        }
+    }
+
     function installMarketabilityStyles() {
         if (document.getElementById('adeo-marketability-styles')) return;
         const style = document.createElement('style'); style.id = 'adeo-marketability-styles';
@@ -2768,26 +3658,8 @@
             record.cancel.hidden = !active(record);
             record.metrics.hidden = !record.result;
             if (record.rendered !== record.result) {
-                record.rendered = record.result; record.metrics.replaceChildren(); record.notes.replaceChildren();
-                if (record.result) {
-                    const data = record.result.result;
-                    const integer = value => new Intl.NumberFormat('ru-RU').format(value);
-                    const items = [['Топ 1', integer(data.top1)], ['Уник', integer(data.unique)], ['Топ 2', integer(data.top2)], ['Топ 3', integer(data.top3)],
-                        ['Всего строк', integer(data.total)], ['% прохождения', `${data.percent.replace('.', ',')}%`],
-                        ['Скидка строк', data.discountRows === null ? '—' : integer(data.discountRows)], ['Убрать строк', data.removeRows === null ? '—' : integer(data.removeRows)]];
-                    items.forEach(([label, value], index) => {
-                        const metric = element('article', 'adeo-marketability-metric'); metric.append(element('span', '', label), element('strong', '', value));
-                        if (index === 5) metric.dataset.target = data.meetsTarget ? 'met' : 'below';
-                        if (index === 6) metric.title = 'Сколько позиций нужно улучшить до топ-1, чтобы достичь 30% прохождения.';
-                        if (index === 7) metric.title = 'Сколько непроходящих позиций нужно исключить, чтобы достичь 30% прохождения.';
-                        record.metrics.append(metric);
-                    });
-                    record.notes.append(element('div', 'adeo-marketability-note', `Цель: 30%. Прохождение = (Топ 1 + Уник) / Всего строк. ${data.meetsTarget ? 'Целевой порог достигнут.' : '«Скидка строк» и «Убрать строк» — альтернативные способы достичь цели.'} Уникальные позиции не включены повторно в Топ 1. Лист: ${record.result.meta.sheet}.`));
-                    if (record.result.warnings.length) {
-                        const details = element('details', ''); details.append(element('summary', '', `Замечания к позициям: ${integer(record.result.meta.invalidRows)}`));
-                        const list = element('ul', ''); record.result.warnings.forEach(text => list.append(element('li', '', text))); details.append(list); record.notes.append(details);
-                    }
-                }
+                record.rendered = record.result;
+                renderMarketabilitySummary(record.metrics, record.notes, record.result);
             }
             updateTime(record);
         }
@@ -2994,9 +3866,18 @@
         else if (window.location.hostname === 'crm.adeo.pro') { initSupplierCalendar(); initMarketability(); }
     }
 
-    installLoadingProgress();
-    installQuickLinksMenu();
+    const autoPriceCheckPage = typeof window !== 'undefined' && window.location?.search &&
+        /^\/admin\/admin_pricerelevance\/list\/?$/.test(window.location.pathname) &&
+        new URLSearchParams(window.location.search).get(AUTO_PRICE_CHECK_PARAM) === '1';
+    if (!autoPriceCheckPage) {
+        installLoadingProgress();
+        installQuickLinksMenu();
+    }
     installRelevanceProgress();
+    if (autoPriceCheckPage) {
+        openAutoPriceCheckPage();
+        return;
+    }
     prepareInitialCompareRequest();
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
     else {

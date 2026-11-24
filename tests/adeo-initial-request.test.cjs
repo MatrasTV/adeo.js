@@ -64,7 +64,7 @@ test('Первичная загрузка отправляет один запр
             window.GM_openInTab = () => {};\n${source}` });
         await page.goto(endpoint);
         await page.waitForFunction(() => window.responses === 3);
-        assert.equal(await page.evaluate(() => window.menuCommands.length), 5, 'Меню должно работать одновременно с ранней подготовкой запроса');
+        assert.equal(await page.evaluate(() => window.menuCommands.length), 6, 'Меню должно работать одновременно с ранней подготовкой запроса');
         let mainRequests = requests.filter(request => request.url === endpoint);
         assert.equal(mainRequests.length, 1, 'При старте должен отправляться только один запрос таблицы');
         const initial = new URLSearchParams(mainRequests[0].body);
