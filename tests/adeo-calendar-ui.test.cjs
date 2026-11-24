@@ -122,6 +122,78 @@ test('Мастер заполняет 20 записей, исправляет с
     } finally { await browser.close(); }
 });
 
+test('Пустой выбор дней доставки позволяет заполнить неделю и добавить отправку без доставки', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 45000
+}, async () => {
+    const { browser, page, dates, errors } = await fixture();
+    try {
+        await page.getByRole('button', { name: 'Мастер расписания', exact: true }).click();
+        await page.getByRole('button', { name: 'Заполнить с нуля' }).click();
+        await page.getByLabel('Начать с', { exact: true }).fill(dates.friday);
+        const orderDays = page.locator('.adeo-schedule-box').filter({ hasText: '2. Когда отправлять' });
+        await orderDays.getByRole('button', { name: 'Снять выбор', exact: true }).click();
+        await orderDays.getByLabel('Пятница', { exact: true }).check();
+        const deliveryDays = page.locator('.adeo-schedule-box').filter({ hasText: '3. Когда поставщик' });
+        await deliveryDays.getByRole('button', { name: 'Снять выбор', exact: true }).click();
+        await page.getByRole('button', { name: 'Далее: заполнить день', exact: true }).click();
+        const deliveryCheck = page.getByLabel('Указать доставку', { exact: true });
+        assert.equal(await deliveryCheck.isChecked(), false);
+        assert.equal(await deliveryCheck.isDisabled(), true);
+        assert.equal(await page.getByLabel('Интервал доставки', { exact: true }).isVisible(), false);
+        await page.getByRole('button', { name: 'Заполнить выбранные дни', exact: true }).click();
+        await page.getByRole('button', { name: '＋ Добавить запись', exact: true }).click();
+        await page.locator('.adeo-schedule-row[open]').getByLabel('Отправка заказа', { exact: true }).fill('12:00');
+        assert.equal(await page.getByText('Без доставки', { exact: true }).count(), 2);
+        await page.getByRole('button', { name: 'Сохранить всё', exact: true }).click();
+        await page.getByRole('button', { name: 'Подтвердить сохранение', exact: true }).click();
+        await page.getByRole('heading', { name: 'Расписание сохранено', exact: true }).waitFor();
+        const payloads = await page.evaluate(() => window.mutations.map(item => item.payload));
+        assert.deepEqual(payloads.map(item => [item.ordersAcceptedAt, item.orderDeliveryIntervalStart, item.orderDeliveryIntervalEnd]), [
+            [`${dates.friday}T09:00:00+03:00`, null, null], [`${dates.friday}T12:00:00+03:00`, null, null]
+        ]);
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
+test('Копирование без дней доставки сохраняет только отправку и подтверждает её по данным CRM', {
+    skip: !chromium && 'Для проверки нужен Playwright и установленный Chrome', timeout: 45000
+}, async () => {
+    const { browser, page, dates, errors } = await fixture();
+    try {
+        await page.evaluate(date => {
+            window.events = [{ id: 1, supplierId: 127, nfile: 7, weeklyScheduleId: 101,
+                ordersAcceptedAt: `${date}T09:00:00+03:00`, orderDeliveryIntervalStart: `${date}T15:00:00+03:00`,
+                orderDeliveryIntervalEnd: `${date}T16:00:00+03:00` }];
+        }, dates.source);
+        await page.getByRole('button', { name: 'Мастер расписания', exact: true }).click();
+        await page.getByRole('button', { name: 'Скопировать день' }).click();
+        await page.getByLabel('Из какого дня', { exact: true }).fill(dates.source);
+        await page.getByLabel('В какой день', { exact: true }).fill(dates.target);
+        await page.getByRole('button', { name: 'Снять выбор', exact: true }).click();
+        await page.getByRole('button', { name: 'Подготовить копию', exact: true }).click();
+        await page.getByText('Без доставки', { exact: true }).waitFor();
+        await page.getByText('Дни доставки и часы приёмки · изменить', { exact: true }).click();
+        await page.getByLabel('Четверг', { exact: true }).check();
+        await page.locator('[data-schedule-row-summary]').click();
+        const deliveryCheck = page.getByLabel('Указать доставку', { exact: true });
+        assert.equal(await deliveryCheck.isChecked(), true);
+        assert.equal(await page.getByLabel('Дата доставки', { exact: true }).inputValue(), dates.target);
+        await page.getByLabel('Четверг', { exact: true }).uncheck();
+        assert.equal(await deliveryCheck.isChecked(), false);
+        assert.equal(await page.getByLabel('Дата доставки', { exact: true }).isVisible(), false);
+        await page.getByRole('button', { name: 'Сохранить всё', exact: true }).click();
+        await page.getByRole('button', { name: 'Подтвердить сохранение', exact: true }).click();
+        await page.getByRole('heading', { name: 'Расписание сохранено', exact: true }).waitFor();
+        const { events, mutations } = await page.evaluate(() => ({ events: window.events, mutations: window.mutations }));
+        assert.equal(mutations.length, 1);
+        assert.equal(events[0].orderDeliveryIntervalStart, `${dates.source}T15:00:00+03:00`);
+        assert.equal(mutations[0].payload.ordersAcceptedAt, `${dates.target}T09:00:00+03:00`);
+        assert.equal(mutations[0].payload.orderDeliveryIntervalStart, null);
+        assert.equal(mutations[0].payload.orderDeliveryIntervalEnd, null);
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
 async function seedCopy(page, dates, repeat = 'weekly') {
     await page.evaluate(({ source, target }) => {
         const entry = (id, date, time, nfile, weekly = true) => ({ id, supplierId: 127, nfile,

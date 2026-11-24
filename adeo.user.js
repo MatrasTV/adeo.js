@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADEO — прайсы и расписание поставщиков
 // @namespace    admin.adeo.pro
-// @version      3.6.2
+// @version      3.6.3
 // @description  Работа с прайсами и мастер расписания поставщиков CRM
 // @author       MatrasTV
 // @icon         https://github.com/MatrasTV.png?size=128
@@ -1602,9 +1602,13 @@
         };
     }
 
-    function scheduleDraftPayload(draft, supplierId) {
-        const start = draft.haveDelivery ? `${schedulePad(draft.deliveryHour)}:00` : null;
-        const end = draft.haveDelivery ? (draft.deliveryHour === 23 ? '23:59' : `${schedulePad(draft.deliveryHour + 1)}:00`) : null;
+    function scheduleHasDelivery(draft, deliveryDays) {
+        return deliveryDays.length > 0 && draft.haveDelivery;
+    }
+
+    function scheduleDraftPayload(draft, supplierId, haveDelivery = draft.haveDelivery) {
+        const start = haveDelivery ? `${schedulePad(draft.deliveryHour)}:00` : null;
+        const end = haveDelivery ? (draft.deliveryHour === 23 ? '23:59' : `${schedulePad(draft.deliveryHour + 1)}:00`) : null;
         return {
             supplierId, nfile: scheduleNfile(draft.nfile) === '' ? null : draft.nfile, repeatWeekly: true,
             ordersAcceptedAt: scheduleTimestamp(draft.sendDate, draft.sendTime),
@@ -1619,7 +1623,7 @@
             parseScheduleDay(draft.sendDate);
             if (draft.sendDate <= today) errors.push('Отправку можно назначить только на будущий день.');
             scheduleTimestamp(draft.sendDate, draft.sendTime);
-            if (draft.haveDelivery) {
+            if (scheduleHasDelivery(draft, allowedDays)) {
                 parseScheduleDay(draft.deliveryDate);
                 const weekday = scheduleWeekday(draft.deliveryDate);
                 if (weekday === 6) errors.push('В воскресенье ваш склад закрыт.');
@@ -1639,16 +1643,19 @@
         if (!orderDays.length) throw new Error('Выберите дни отправки заказов.');
         if (!template.length) throw new Error('Добавьте хотя бы одну отправку в шаблон.');
         for (const row of template) {
-            if (!Number.isInteger(row.leadDays) || row.leadDays < 0) throw new Error('Срок доставки — целое неотрицательное число дней.');
+            if (scheduleHasDelivery(row, deliveryDays) && (!Number.isInteger(row.leadDays) || row.leadDays < 0)) {
+                throw new Error('Срок доставки — целое неотрицательное число дней.');
+            }
         }
         return SCHEDULE_WEEKDAYS.map((name, weekday) => {
             const date = nextScheduleWeekday(startDate, weekday);
             const enabled = orderDays.includes(weekday);
-            return { date, weekday, enabled, nfiles: [nfile], entries: enabled ? template.map(row => ({
-                uid: String(++scheduleDraftSequence), nfile, sendDate: date, sendTime: row.sendTime,
-                haveDelivery: row.haveDelivery, deliveryDate: row.haveDelivery ? nextScheduleDelivery(addScheduleDays(date, row.leadDays), deliveryDays) : '',
-                deliveryHour: row.deliveryHour
-            })) : [] };
+            return { date, weekday, enabled, nfiles: [nfile], entries: enabled ? template.map(row => {
+                const haveDelivery = scheduleHasDelivery(row, deliveryDays);
+                return { uid: String(++scheduleDraftSequence), nfile, sendDate: date, sendTime: row.sendTime,
+                    haveDelivery, deliveryDate: haveDelivery ? nextScheduleDelivery(addScheduleDays(date, row.leadDays), deliveryDays) : '',
+                    deliveryHour: row.deliveryHour };
+            }) : [] };
         });
     }
 
@@ -1746,7 +1753,7 @@
                 }
             }
             for (const draft of group.entries) {
-                const payload = { ...scheduleDraftPayload(draft, supplierId), repeatWeekly: group.repeatWeekly !== false };
+                const payload = { ...scheduleDraftPayload(draft, supplierId, scheduleHasDelivery(draft, deliveryDays)), repeatWeekly: group.repeatWeekly !== false };
                 if (decision === 'add') {
                     const sameWeeklySlot = weekly.filter(series => series.instances.some(event =>
                         scheduleScopesOverlap(event.nfile, draft.nfile) && scheduleTime(event.ordersAcceptedAt) === draft.sendTime));
@@ -2112,7 +2119,8 @@
             button(presets, 'Будни', () => apply([0, 1, 2, 3, 4]));
             button(presets, delivery ? 'Пн–Сб' : 'Все дни', () => apply(delivery ? [0, 1, 2, 3, 4, 5] : [0, 1, 2, 3, 4, 5, 6]));
             button(presets, 'Снять выбор', () => apply([])); box.append(presets);
-            if (delivery) note(box, 'Будни — круглосуточно. Суббота — до 16:00. Воскресенье — выходной.'); parent.append(box);
+            if (delivery) note(box, 'Будни — круглосуточно. Суббота — до 16:00. Воскресенье — выходной. Снимите все галочки, чтобы сохранить отправки без доставки.');
+            parent.append(box);
         }
         function freshTemplate() { return { uid: String(++scheduleDraftSequence), sendTime: '09:00', leadDays: 1, deliveryHour: 15, haveDelivery: true }; }
         function allDrafts() { return state.groups.filter(group => group.enabled).flatMap(group => group.entries); }
@@ -2138,13 +2146,19 @@
                 if (box) box.textContent = errors.join(' ');
                 const summary = content.querySelector(`[data-schedule-row-summary="${row.uid}"]`);
                 if (summary) {
+                    const haveDelivery = scheduleHasDelivery(row, state.deliveryDays);
+                    const rowBox = summary.parentElement;
+                    const deliveryCheck = rowBox.querySelector('[data-schedule-delivery-check]');
+                    deliveryCheck.checked = haveDelivery;
+                    deliveryCheck.disabled = !state.deliveryDays.length;
+                    rowBox.querySelector('.adeo-schedule-row-delivery').hidden = !haveDelivery;
                     const warehouse = state.mode === 'copy' ? (scheduleNfile(row.nfile) ? ` · склад ${row.nfile}` : ' · все склады') : '';
                     summary.replaceChildren(
                         scheduleElement('span', `${row.sendTime || 'Укажите время'}${warehouse}`, 'adeo-schedule-row-time'),
-                        scheduleElement('span', row.haveDelivery ? `${displayScheduleDay(row.deliveryDate, false)} · ${scheduleHourLabel(row.deliveryHour)}` : 'Без доставки', 'adeo-schedule-row-delivery-text')
+                        scheduleElement('span', haveDelivery ? `${displayScheduleDay(row.deliveryDate, false)} · ${scheduleHourLabel(row.deliveryHour)}` : 'Без доставки', 'adeo-schedule-row-delivery-text')
                     );
                     if (errors.length) summary.append(scheduleElement('span', 'Требует исправления', 'adeo-schedule-row-issue'));
-                    summary.parentElement.classList.toggle('adeo-schedule-row-invalid', errors.length > 0);
+                    rowBox.classList.toggle('adeo-schedule-row-invalid', errors.length > 0);
                 }
             }
             const summary = content.querySelector('[data-schedule-summary]');
@@ -2169,11 +2183,14 @@
             const update = () => { if (!template) updateReviewErrors(); };
             field(box, 'Отправка заказа', 'time', row.sendTime, value => { row.sendTime = value; update(); }, { step: '60', required: '' });
             const deliveryControls = scheduleElement('div', null, 'adeo-schedule-row-delivery');
-            check(box, 'Указать доставку', row.haveDelivery, value => {
+            const haveDelivery = scheduleHasDelivery(row, state.deliveryDays);
+            const deliveryCheck = check(box, 'Указать доставку', haveDelivery, value => {
                 row.haveDelivery = value;
                 if (!template && value && !row.deliveryDate) row.deliveryDate = nextScheduleDelivery(row.sendDate, state.deliveryDays);
                 render();
-            });
+            }, !state.deliveryDays.length);
+            deliveryCheck.dataset.scheduleDeliveryCheck = '';
+            deliveryControls.hidden = !haveDelivery;
             if (row.haveDelivery) {
                 if (template) field(deliveryControls, 'Через календарных дней', 'number', row.leadDays, value => { row.leadDays = value === '' ? NaN : Number(value); }, { min: '0', step: '1', required: '' });
                 else field(deliveryControls, 'Дата доставки', 'date', row.deliveryDate, value => { row.deliveryDate = value; update(); }, { min: row.sendDate, required: '' });
@@ -2212,7 +2229,7 @@
                     parseScheduleDay(state.startDate);
                     if (state.startDate <= scheduleDay()) throw new Error('Выберите дату начала не раньше завтра.');
                     if (!state.orderDays.length) throw new Error('Выберите хотя бы один день отправки.');
-                    nextScheduleDelivery(state.startDate, state.deliveryDays); state.phase = 'template'; render();
+                    state.phase = 'template'; render();
                 }, 'primary');
             } else {
                 const box = scheduleElement('div', null, 'adeo-schedule-box'); box.append(scheduleElement('h3', 'Копирование еженедельных записей'));
@@ -2225,7 +2242,6 @@
                     parseScheduleDay(state.sourceDate); parseScheduleDay(state.targetDate);
                     if (state.sourceDate === state.targetDate) throw new Error('Выберите другой день назначения.');
                     if (state.targetDate <= scheduleDay()) throw new Error('День назначения должен быть будущим.');
-                    nextScheduleDelivery(state.targetDate, state.deliveryDays);
                     assertContext(); setBusy(true);
                     try {
                         const events = await adapter.list(supplierId);
@@ -2243,7 +2259,7 @@
 
         function renderSaturdayFix(parent) {
             const rows = allDrafts().filter(row => {
-                try { return row.haveDelivery && row.deliveryDate && scheduleWeekday(row.deliveryDate) === 5 && row.deliveryHour > 15; }
+                try { return scheduleHasDelivery(row, state.deliveryDays) && row.deliveryDate && scheduleWeekday(row.deliveryDate) === 5 && row.deliveryHour > 15; }
                 catch { return false; }
             });
             if (!rows.length) return;
@@ -2285,8 +2301,10 @@
                 if (group.enabled) {
                     const actions = scheduleElement('div', null, 'adeo-schedule-day-actions');
                     const add = button(actions, '＋ Добавить запись', () => {
+                        const haveDelivery = state.deliveryDays.length > 0;
+                        const deliveryDate = haveDelivery ? nextScheduleDelivery(addScheduleDays(group.date, 1), state.deliveryDays) : '';
                         group.entries.push({ uid: String(++scheduleDraftSequence), nfile: state.mode === 'new' ? state.nfile : group.nfiles[0],
-                            sendDate: group.date, sendTime: '09:00', haveDelivery: true, deliveryDate: nextScheduleDelivery(addScheduleDays(group.date, 1), state.deliveryDays), deliveryHour: 15, expanded: true }); state.dirty = true; render();
+                            sendDate: group.date, sendTime: '09:00', haveDelivery, deliveryDate, deliveryHour: 15, expanded: true }); state.dirty = true; render();
                     });
                     add.setAttribute('aria-label', '＋ Добавить запись'); add.textContent = '＋ Запись'; add.title = 'Добавить запись в этот день';
                     if (state.mode === 'new') {
@@ -2456,7 +2474,7 @@
             assertContext();
             const job = makeSchedulePlan(state.events, state.groups, state.decisions, supplierId, state.deliveryDays);
             if (state.mode === 'copy') job.copyDrafts = state.groups.filter(group => group.enabled && state.decisions[group.date] !== 'skip')
-                .flatMap(group => group.entries.map(draft => ({ ...draft })));
+                .flatMap(group => group.entries.map(draft => ({ ...draft, haveDelivery: scheduleHasDelivery(draft, state.deliveryDays) })));
             setBusy(true);
             try {
                 const latest = await adapter.list(supplierId);
